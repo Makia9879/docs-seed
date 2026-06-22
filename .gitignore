@@ -1,0 +1,6 @@
+/docs-seed
+/dist/
+/.docs-seed/
+!/.docs-seed/docs/
+!/.docs-seed/branch-graph.json
+*.log
