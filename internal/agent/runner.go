@@ -17,6 +17,7 @@ import (
 
 type Generator interface {
 	Generate(ctx context.Context, workDir, prompt string) (model.Fact, error)
+	GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error)
 	Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error)
 }
 
@@ -24,13 +25,47 @@ type Runner struct {
 	Config config.AgentConfig
 }
 
+type commitFactBatch struct {
+	Commits []model.CommitFact `json:"commits"`
+}
+
 func (r Runner) Generate(ctx context.Context, workDir, prompt string) (model.Fact, error) {
+	content, err := r.run(ctx, workDir, prompt)
+	if err != nil {
+		return model.Fact{}, err
+	}
+	var fact model.Fact
+	if err := json.Unmarshal([]byte(extractJSONObject(content)), &fact); err != nil {
+		return model.Fact{}, fmt.Errorf("Agent 输出不是有效文档事实 JSON: %w", err)
+	}
+	if len(fact.BusinessLogic) == 0 && len(fact.DataFlow) == 0 && len(fact.ArchitectureDecisions) == 0 {
+		return model.Fact{}, errors.New("Agent 未生成业务逻辑、数据流或 ADR 内容")
+	}
+	return fact, nil
+}
+
+func (r Runner) GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error) {
+	content, err := r.run(ctx, workDir, prompt)
+	if err != nil {
+		return nil, err
+	}
+	var batch commitFactBatch
+	if err := json.Unmarshal([]byte(extractJSONObject(content)), &batch); err != nil {
+		return nil, fmt.Errorf("Agent 输出不是有效批量 commit facts JSON: %w", err)
+	}
+	if len(batch.Commits) == 0 {
+		return nil, errors.New("Agent 未生成任何 commit facts")
+	}
+	return batch.Commits, nil
+}
+
+func (r Runner) run(ctx context.Context, workDir, prompt string) (string, error) {
 	command := r.Config.Command[r.Config.Engine]
 	if command == "" {
 		command = r.Config.Engine
 	}
 	if command == "" {
-		return model.Fact{}, errors.New("agent.engine 未配置")
+		return "", errors.New("agent.engine 未配置")
 	}
 	timeout := time.Duration(r.Config.Timeout) * time.Second
 	if timeout <= 0 {
@@ -54,18 +89,10 @@ func (r Runner) Generate(ctx context.Context, workDir, prompt string) (model.Fac
 	start := time.Now()
 	fmt.Printf("      agent %s generate start: dir=%s timeout=%s\n", r.Config.Engine, workDir, timeout)
 	if err := cmd.Run(); err != nil {
-		return model.Fact{}, fmt.Errorf("调用 %s 失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("调用 %s 失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
 	}
 	fmt.Printf("      agent %s generate done: %s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond))
-	content := extractContent(r.Config.Engine, stdout.String())
-	var fact model.Fact
-	if err := json.Unmarshal([]byte(extractJSONObject(content)), &fact); err != nil {
-		return model.Fact{}, fmt.Errorf("Agent 输出不是有效文档事实 JSON: %w", err)
-	}
-	if len(fact.BusinessLogic) == 0 && len(fact.DataFlow) == 0 && len(fact.ArchitectureDecisions) == 0 {
-		return model.Fact{}, errors.New("Agent 未生成业务逻辑、数据流或 ADR 内容")
-	}
-	return fact, nil
+	return extractContent(r.Config.Engine, stdout.String()), nil
 }
 
 func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {

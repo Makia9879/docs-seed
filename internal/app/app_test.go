@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,9 +33,25 @@ func (fakeGenerator) Generate(_ context.Context, _ string, prompt string) (model
 	}, nil
 }
 
+func (fakeGenerator) GenerateCommits(_ context.Context, _ string, prompt string) ([]model.CommitFact, error) {
+	var result []model.CommitFact
+	for _, hash := range hashesFromPrompt(prompt) {
+		result = append(result, model.CommitFact{
+			Commit: model.Commit{Hash: hash},
+			Fact: model.Fact{
+				BusinessLogic:         []string{"提交业务规则"},
+				DataFlow:              []string{"提交数据从入口流向存储"},
+				ArchitectureDecisions: []string{"提交架构决策来自源码边界"},
+				Evidence:              []model.Evidence{{Path: "service/order.go", Description: "业务证据"}},
+			},
+		})
+	}
+	return result, nil
+}
+
 func (fakeGenerator) Write(_ context.Context, workDir, prompt string, _ ...string) (string, error) {
 	output := workDir
-	hash := "unknown"
+	hashes := hashesFromPrompt(prompt)
 	if strings.Contains(prompt, "写入目录：") {
 		for _, line := range strings.Split(prompt, "\n") {
 			line = strings.TrimSpace(line)
@@ -44,27 +61,26 @@ func (fakeGenerator) Write(_ context.Context, workDir, prompt string, _ ...strin
 			}
 		}
 	}
-	if strings.Contains(prompt, "当前 commit：") {
-		for _, line := range strings.Split(prompt, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "当前 commit：") {
-				fields := strings.Fields(strings.TrimPrefix(line, "当前 commit："))
-				if len(fields) > 0 {
-					hash = fields[0]
-				}
-				break
-			}
-		}
+	if len(hashes) == 0 && strings.Contains(prompt, "当前 commit：") {
+		hashes = append(hashes, hashFromCurrentCommitLine(prompt))
+	}
+	if len(hashes) == 0 {
+		hashes = append(hashes, "unknown")
 	}
 	if err := os.MkdirAll(output, 0o755); err != nil {
 		return "", err
 	}
 	for _, name := range []string{"README.md", "business-logic.md", "data-flow.md", "adr.md"} {
-		if err := os.WriteFile(filepath.Join(output, name), []byte("# "+name+"\n\nprocessed "+hash+"\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(output, name), []byte("# "+name+"\n\nprocessed "+strings.Join(hashes, "\nprocessed ")+"\n"), 0o644); err != nil {
 			return "", err
 		}
 	}
-	return "written", os.WriteFile(filepath.Join(output, "commit-evolution.md"), []byte("# commit-evolution.md\n\n## "+hash+" root business\n\n- 业务演进事实。\n"), 0o644)
+	var evolution strings.Builder
+	evolution.WriteString("# commit-evolution.md\n\n")
+	for _, hash := range hashes {
+		fmt.Fprintf(&evolution, "## %s root business\n\n- 业务演进事实。\n\n", hash)
+	}
+	return "written", os.WriteFile(filepath.Join(output, "commit-evolution.md"), []byte(evolution.String()), 0o644)
 }
 
 type noOpWriteGenerator struct {
@@ -83,9 +99,24 @@ func (g *countingWriteGenerator) Generate(ctx context.Context, workDir, prompt s
 	return fakeGenerator{}.Generate(ctx, workDir, prompt)
 }
 
+func (g *countingWriteGenerator) GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error) {
+	return fakeGenerator{}.GenerateCommits(ctx, workDir, prompt)
+}
+
 func (g *countingWriteGenerator) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {
 	g.count++
 	return fakeGenerator{}.Write(ctx, workDir, prompt, addDirs...)
+}
+
+type countingCommitGenerator struct {
+	fakeGenerator
+	batches []int
+}
+
+func (g *countingCommitGenerator) GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error) {
+	hashes := hashesFromPrompt(prompt)
+	g.batches = append(g.batches, len(hashes))
+	return fakeGenerator{}.GenerateCommits(ctx, workDir, prompt)
 }
 
 func TestLearnAndGenerateCurrentChain(t *testing.T) {
@@ -168,7 +199,7 @@ func TestLearnEvolutionCachesCommitsAndGeneratesEvolutionDoc(t *testing.T) {
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
 
-	changed, err := instance.LearnChainEvolution(context.Background(), chain, false)
+	changed, err := instance.LearnChainEvolution(context.Background(), chain, false, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, changed)
 	require.NoError(t, instance.GenerateChain(chain))
@@ -179,6 +210,66 @@ func TestLearnEvolutionCachesCommitsAndGeneratesEvolutionDoc(t *testing.T) {
 	require.Contains(t, evolution, "root business")
 	require.Contains(t, evolution, "approve order")
 	require.Contains(t, evolution, "提交业务规则")
+}
+
+func TestLearnEvolutionBatchesCommitAnalysis(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 5; i++ {
+		writeFile(t, root, "service/order.go", strings.Repeat("package service\n", i))
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-m", "order batch")
+	}
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingCommitGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	changed, err := instance.LearnChainEvolution(context.Background(), chain, false, 3)
+	require.NoError(t, err)
+	require.Equal(t, 1, changed)
+	require.Equal(t, []int{3, 2}, generator.batches)
+}
+
+func TestWorkspaceSyncUsesRootEvolutionBatchSize(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "service-a")
+	require.NoError(t, os.MkdirAll(project, 0o755))
+	runGit(t, project, "init", "-b", "main")
+	runGit(t, project, "config", "user.email", "docs-seed@example.com")
+	runGit(t, project, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 5; i++ {
+		writeFile(t, project, "service/order.go", strings.Repeat("package service\n", i))
+		runGit(t, project, "add", ".")
+		runGit(t, project, "commit", "-m", "order batch")
+	}
+
+	rootCfg := config.Default("workspace")
+	rootCfg.Workspace.Projects = []string{"service-a"}
+	rootCfg.Evolution.BatchSize = 2
+	require.NoError(t, config.Save(root, rootCfg))
+	childCfg := config.Default("service-a")
+	childCfg.Branches.MainPatterns = []string{"main"}
+	childCfg.Evolution.BatchSize = 8
+	require.NoError(t, config.Save(project, childCfg))
+
+	generator := &countingCommitGenerator{}
+	instance := &App{
+		Root: root, Config: rootCfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	require.NoError(t, instance.SyncWorkspace(context.Background(), false, true, false, 0, 2))
+
+	require.Equal(t, []int{2, 2, 1}, generator.batches)
 }
 
 func TestGenerateChainDirectWritesDocumentsWithoutParsingJSON(t *testing.T) {
@@ -200,7 +291,7 @@ func TestGenerateChainDirectWritesDocumentsWithoutParsingJSON(t *testing.T) {
 	require.NoError(t, err)
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
-	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
 
 	output := filepath.Join(root, ".docs-seed", "docs", "branches", "main")
 	require.FileExists(t, filepath.Join(output, "README.md"))
@@ -231,7 +322,7 @@ func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
 
-	err = instance.GenerateChainDirect(context.Background(), chain, 0)
+	err = instance.GenerateChainDirect(context.Background(), chain, 0, 0)
 	require.ErrorContains(t, err, "Agent 未在 commit-evolution.md 记录当前提交")
 }
 
@@ -256,9 +347,9 @@ func TestGenerateChainDirectResumesFromCheckpointAndExistingDocs(t *testing.T) {
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
 
-	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
 	require.Equal(t, 1, generator.count)
-	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
 	require.Equal(t, 1, generator.count)
 }
 
@@ -282,4 +373,52 @@ func readFile(t *testing.T, path string) string {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(data)
+}
+
+func hashesFromPrompt(prompt string) []string {
+	var hashes []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(prompt, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "hash: ") {
+			hash := strings.TrimSpace(strings.TrimPrefix(line, "hash: "))
+			if hash != "" && !seen[hash] {
+				seen[hash] = true
+				hashes = append(hashes, hash)
+			}
+		}
+		if strings.HasPrefix(line, "- ") {
+			fields := strings.Fields(strings.TrimPrefix(line, "- "))
+			if len(fields) > 0 && isHexHash(fields[0]) && !seen[fields[0]] {
+				seen[fields[0]] = true
+				hashes = append(hashes, fields[0])
+			}
+		}
+	}
+	return hashes
+}
+
+func hashFromCurrentCommitLine(prompt string) string {
+	for _, line := range strings.Split(prompt, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "当前 commit：") {
+			fields := strings.Fields(strings.TrimPrefix(line, "当前 commit："))
+			if len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+	return "unknown"
+}
+
+func isHexHash(value string) bool {
+	if len(value) < 12 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }

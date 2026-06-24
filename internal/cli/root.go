@@ -118,9 +118,10 @@ func learnCommand() *cobra.Command {
 		parent.AddCommand(cmd)
 	}
 	var evolutionForce bool
+	var evolutionBatchSize int
 	evolution := &cobra.Command{
 		Use:   "evolution",
-		Short: "从根主分支第一个提交开始逐提交学习业务演进",
+		Short: "从根主分支第一个提交开始按批次学习业务演进",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			instance, err := openCurrent()
 			if err != nil {
@@ -134,7 +135,7 @@ func learnCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			changed, err := instance.LearnChainEvolution(cmd.Context(), chain, evolutionForce)
+			changed, err := instance.LearnChainEvolution(cmd.Context(), chain, evolutionForce, evolutionBatchSize)
 			if err != nil {
 				return err
 			}
@@ -143,6 +144,7 @@ func learnCommand() *cobra.Command {
 		},
 	}
 	evolution.Flags().BoolVar(&evolutionForce, "force", false, "忽略已缓存的提交事实并重新学习")
+	evolution.Flags().IntVar(&evolutionBatchSize, "batch-size", 0, "每次 Agent 调用分析多少个有效提交，0 使用配置 evolution.batch_size")
 	parent.AddCommand(evolution)
 	return parent
 }
@@ -184,6 +186,7 @@ func syncCommand() *cobra.Command {
 	var evolution bool
 	var directWrite bool
 	var directLimit int
+	var evolutionBatchSize int
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "拉取分支、学习当前链路并生成文档",
@@ -192,7 +195,7 @@ func syncCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := instance.Sync(cmd.Context(), branch, force, evolution, directWrite, directLimit); err != nil {
+			if err := instance.Sync(cmd.Context(), branch, force, evolution, directWrite, directLimit, evolutionBatchSize); err != nil {
 				return err
 			}
 			fmt.Println("文档同步完成")
@@ -204,6 +207,7 @@ func syncCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&evolution, "evolution", false, "按提交顺序逐步学习业务演进")
 	cmd.Flags().BoolVar(&directWrite, "direct-write", false, "让 Agent 直接写 Markdown 文档，主进程不解析 JSON")
 	cmd.Flags().IntVar(&directLimit, "limit-commits", 0, "direct-write 调试用：最多处理多少个有效提交，0 表示不限制")
+	cmd.Flags().IntVar(&evolutionBatchSize, "batch-size", 0, "evolution 模式下每次 Agent 调用分析多少个有效提交，0 使用配置 evolution.batch_size")
 	return cmd
 }
 

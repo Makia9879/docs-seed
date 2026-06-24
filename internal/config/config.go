@@ -17,6 +17,7 @@ type Config struct {
 	Project   ProjectConfig   `yaml:"project"`
 	Branches  BranchConfig    `yaml:"branches"`
 	Agent     AgentConfig     `yaml:"agent"`
+	Evolution EvolutionConfig `yaml:"evolution"`
 	Docs      DocsConfig      `yaml:"docs"`
 	Workspace WorkspaceConfig `yaml:"workspace"`
 	Exclude   []string        `yaml:"exclude"`
@@ -38,6 +39,11 @@ type AgentConfig struct {
 	Engine  string            `yaml:"engine"`
 	Command map[string]string `yaml:"commands"`
 	Timeout int               `yaml:"timeout_seconds"`
+}
+
+type EvolutionConfig struct {
+	BatchSize    int `yaml:"batch_size"`
+	DiffMaxBytes int `yaml:"diff_max_bytes"`
 }
 
 type DocsConfig struct {
@@ -68,6 +74,10 @@ func Default(name string) Config {
 				"codex":  "codex",
 			},
 			Timeout: 1800,
+		},
+		Evolution: EvolutionConfig{
+			BatchSize:    8,
+			DiffMaxBytes: 120000,
 		},
 		Docs: DocsConfig{Output: ".docs-seed/docs"},
 		Exclude: []string{
@@ -100,6 +110,12 @@ func Load(root string) (Config, error) {
 	}
 	if cfg.Agent.Timeout <= 0 {
 		cfg.Agent.Timeout = 1800
+	}
+	if cfg.Evolution.BatchSize <= 0 {
+		cfg.Evolution.BatchSize = 8
+	}
+	if cfg.Evolution.DiffMaxBytes <= 0 {
+		cfg.Evolution.DiffMaxBytes = 120000
 	}
 	return cfg, nil
 }
