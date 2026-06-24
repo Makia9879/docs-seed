@@ -26,17 +26,38 @@ type Evidence struct {
 	Description string `json:"description,omitempty"`
 }
 
+type Commit struct {
+	Hash      string   `json:"hash"`
+	Parent    string   `json:"parent,omitempty"`
+	Subject   string   `json:"subject"`
+	Body      string   `json:"body,omitempty"`
+	Files     []string `json:"files,omitempty"`
+	Diff      string   `json:"diff,omitempty"`
+	Timestamp string   `json:"timestamp,omitempty"`
+}
+
 type Fact struct {
-	Version       int        `json:"version"`
-	Branch        string     `json:"branch"`
-	Parent        string     `json:"parent,omitempty"`
-	Mode          string     `json:"mode"`
-	BaseCommit    string     `json:"base_commit,omitempty"`
-	HeadCommit    string     `json:"head_commit"`
-	BusinessLogic []string   `json:"business_logic"`
-	DataFlow      []string   `json:"data_flow"`
-	Evidence      []Evidence `json:"evidence"`
-	GeneratedAt   string     `json:"generated_at"`
+	Version               int        `json:"version"`
+	Branch                string     `json:"branch"`
+	Parent                string     `json:"parent,omitempty"`
+	Mode                  string     `json:"mode"`
+	BaseCommit            string     `json:"base_commit,omitempty"`
+	HeadCommit            string     `json:"head_commit"`
+	BusinessLogic         []string   `json:"business_logic"`
+	DataFlow              []string   `json:"data_flow"`
+	ArchitectureDecisions []string   `json:"architecture_decisions"`
+	Evidence              []Evidence `json:"evidence"`
+	GeneratedAt           string     `json:"generated_at"`
+}
+
+type CommitFact struct {
+	Version     int    `json:"version"`
+	Branch      string `json:"branch"`
+	Commit      Commit `json:"commit"`
+	Skipped     bool   `json:"skipped,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Fact        Fact   `json:"fact"`
+	GeneratedAt string `json:"generated_at"`
 }
 
 func NewGraph(remote string, patterns []string, branches []BranchNode) BranchGraph {

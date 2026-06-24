@@ -18,6 +18,7 @@ func Ensure(root string) error {
 	for _, dir := range []string{
 		StateDir(root),
 		filepath.Join(StateDir(root), "state", "facts"),
+		filepath.Join(StateDir(root), "state", "commits"),
 		filepath.Join(StateDir(root), "memory", "agent-outputs"),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -49,6 +50,27 @@ func SaveFact(root string, fact model.Fact) error {
 func LoadFact(root, branch string) (model.Fact, error) {
 	var fact model.Fact
 	err := readJSON(FactPath(root, branch), &fact)
+	return fact, err
+}
+
+func CommitFactPath(root, branch, hash string) string {
+	if len(hash) > 12 {
+		hash = hash[:12]
+	}
+	return filepath.Join(CommitFactDir(root, branch), safeName(hash)+".json")
+}
+
+func CommitFactDir(root, branch string) string {
+	return filepath.Join(StateDir(root), "state", "commits", safeName(branch))
+}
+
+func SaveCommitFact(root string, fact model.CommitFact) error {
+	return writeJSON(CommitFactPath(root, fact.Branch, fact.Commit.Hash), fact)
+}
+
+func LoadCommitFact(root, branch, hash string) (model.CommitFact, error) {
+	var fact model.CommitFact
+	err := readJSON(CommitFactPath(root, branch, hash), &fact)
 	return fact, err
 }
 

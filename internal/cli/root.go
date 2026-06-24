@@ -117,6 +117,33 @@ func learnCommand() *cobra.Command {
 		cmd.Flags().BoolVar(&force, "force", false, "忽略指纹并重新学习")
 		parent.AddCommand(cmd)
 	}
+	var evolutionForce bool
+	evolution := &cobra.Command{
+		Use:   "evolution",
+		Short: "从根主分支第一个提交开始逐提交学习业务演进",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			instance, err := openCurrent()
+			if err != nil {
+				return err
+			}
+			graph, err := loadOrSync(cmd.Context(), instance)
+			if err != nil {
+				return err
+			}
+			chain, err := instance.CurrentChain(cmd.Context(), graph, "")
+			if err != nil {
+				return err
+			}
+			changed, err := instance.LearnChainEvolution(cmd.Context(), chain, evolutionForce)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("已按提交演进学习 %d 个分支节点\n", changed)
+			return nil
+		},
+	}
+	evolution.Flags().BoolVar(&evolutionForce, "force", false, "忽略已缓存的提交事实并重新学习")
+	parent.AddCommand(evolution)
 	return parent
 }
 
@@ -154,6 +181,8 @@ func generateCommand() *cobra.Command {
 func syncCommand() *cobra.Command {
 	var branch string
 	var force bool
+	var evolution bool
+	var directWrite bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "拉取分支、学习当前链路并生成文档",
@@ -162,7 +191,7 @@ func syncCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := instance.Sync(cmd.Context(), branch, force); err != nil {
+			if err := instance.Sync(cmd.Context(), branch, force, evolution, directWrite); err != nil {
 				return err
 			}
 			fmt.Println("文档同步完成")
@@ -171,6 +200,8 @@ func syncCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&branch, "branch", "", "指定匹配主分支；默认当前分支")
 	cmd.Flags().BoolVar(&force, "force", false, "强制重新学习链路")
+	cmd.Flags().BoolVar(&evolution, "evolution", false, "按提交顺序逐步学习业务演进")
+	cmd.Flags().BoolVar(&directWrite, "direct-write", false, "让 Agent 直接写 Markdown 文档，主进程不解析 JSON")
 	return cmd
 }
 

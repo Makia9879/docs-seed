@@ -17,6 +17,7 @@ import (
 
 type Generator interface {
 	Generate(ctx context.Context, workDir, prompt string) (model.Fact, error)
+	Write(ctx context.Context, workDir, prompt string) error
 }
 
 type Runner struct {
@@ -58,10 +59,43 @@ func (r Runner) Generate(ctx context.Context, workDir, prompt string) (model.Fac
 	if err := json.Unmarshal([]byte(extractJSONObject(content)), &fact); err != nil {
 		return model.Fact{}, fmt.Errorf("Agent 输出不是有效文档事实 JSON: %w", err)
 	}
-	if len(fact.BusinessLogic) == 0 && len(fact.DataFlow) == 0 {
-		return model.Fact{}, errors.New("Agent 未生成业务逻辑或数据流内容")
+	if len(fact.BusinessLogic) == 0 && len(fact.DataFlow) == 0 && len(fact.ArchitectureDecisions) == 0 {
+		return model.Fact{}, errors.New("Agent 未生成业务逻辑、数据流或 ADR 内容")
 	}
 	return fact, nil
+}
+
+func (r Runner) Write(ctx context.Context, workDir, prompt string) error {
+	command := r.Config.Command[r.Config.Engine]
+	if command == "" {
+		command = r.Config.Engine
+	}
+	if command == "" {
+		return errors.New("agent.engine 未配置")
+	}
+	timeout := time.Duration(r.Config.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var args []string
+	switch r.Config.Engine {
+	case "codex":
+		args = []string{"--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "-"}
+	default:
+		args = []string{"--print", "--no-session-persistence", "--disable-slash-commands", "--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit"}
+	}
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Dir = workDir
+	cmd.Stdin = strings.NewReader(prompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 func extractContent(engine, raw string) string {

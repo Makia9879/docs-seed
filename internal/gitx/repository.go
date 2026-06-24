@@ -164,6 +164,9 @@ func (r Repository) BuildGraph(ctx context.Context, cfg config.BranchConfig) (mo
 
 func (r Repository) parentFor(ctx context.Context, child Ref, refs []Ref, overrides map[string]string) (string, string, error) {
 	if parent := strings.TrimSpace(overrides[child.Name]); parent != "" {
+		if parent == "__root__" {
+			return "", "", nil
+		}
 		for _, ref := range refs {
 			if ref.Name == parent {
 				fork, err := r.run(ctx, "merge-base", child.Hash, ref.Hash)
@@ -316,6 +319,64 @@ func (r Repository) Log(ctx context.Context, base, head string) (string, error) 
 		rangeArg = base + ".." + head
 	}
 	return r.run(ctx, "log", "--reverse", "--format=%H%x09%s", rangeArg)
+}
+
+func (r Repository) Commits(ctx context.Context, base, head string) ([]model.Commit, error) {
+	rangeArg := head
+	if base != "" {
+		rangeArg = base + ".." + head
+	}
+	format := "%H%x00%P%x00%ct%x00%s%x00%b%x1e"
+	out, err := r.run(ctx, "log", "--reverse", "--format="+format, rangeArg)
+	if err != nil {
+		return nil, err
+	}
+	var commits []model.Commit
+	for _, record := range strings.Split(out, "\x1e") {
+		record = strings.TrimSpace(record)
+		if record == "" {
+			continue
+		}
+		parts := strings.SplitN(record, "\x00", 5)
+		if len(parts) != 5 {
+			continue
+		}
+		parent := ""
+		if fields := strings.Fields(parts[1]); len(fields) > 0 {
+			parent = fields[0]
+		}
+		unix, _ := strconv.ParseInt(parts[2], 10, 64)
+		files, err := r.ChangedFiles(ctx, parent, parts[0])
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, model.Commit{
+			Hash:      parts[0],
+			Parent:    parent,
+			Subject:   parts[3],
+			Body:      strings.TrimSpace(parts[4]),
+			Files:     files,
+			Timestamp: time.Unix(unix, 0).UTC().Format(time.RFC3339),
+		})
+	}
+	return commits, nil
+}
+
+func (r Repository) Diff(ctx context.Context, base, head string, maxBytes int) (string, error) {
+	args := []string{"diff", "--find-renames", "--stat", "--patch", "--diff-filter=ACMRT"}
+	if base != "" {
+		args = append(args, base+".."+head)
+	} else {
+		args = append(args, head+"^!", "--root")
+	}
+	out, err := r.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	if maxBytes > 0 && len(out) > maxBytes {
+		return out[:maxBytes] + "\n\n[docs-seed: diff truncated]\n", nil
+	}
+	return out, nil
 }
 
 func (r Repository) Snapshot(ctx context.Context, ref string) (string, func(), error) {
