@@ -77,21 +77,63 @@ go install ./cmd/docs-seed
 
 ## 快速开始
 
+在要分析的 Git 仓库根目录执行：
+
 ```bash
 docs-seed init
-docs-seed branches sync
-docs-seed sync --evolution
 ```
 
-默认 Agent 是 Claude CLI。也可以修改 `.docs-seed.yml`：
+按项目实际情况修改 `.docs-seed.yml`。最常见需要调整的是主分支匹配、父分支关系、
+Agent 和文档输出目录：
 
 ```yaml
+branches:
+  main_patterns:
+    - develop_V*
+  parent_overrides:
+    develop_V1.0.0: __root__
+    develop_V2.0.0: develop_V1.0.0
+    develop_V2.1.0: develop_V2.0.0
 agent:
-  engine: codex
+  engine: claude
   commands:
     claude: claude
     codex: codex
   timeout_seconds: 1800
+docs:
+  output: ../docs-seed-docs/ca_admin
+```
+
+同步分支谱系并生成当前分支文档：
+
+```bash
+docs-seed branches sync
+docs-seed sync --evolution
+```
+
+指定目标主分支：
+
+```bash
+docs-seed sync --evolution --branch develop_V2.1.0
+```
+
+如果 Claude/Codex 的 JSON 输出不稳定，使用 direct-write，让 Agent 直接更新 Markdown：
+
+```bash
+docs-seed sync --evolution --direct-write --branch develop_V2.1.0
+```
+
+调试时先处理 1 个新提交：
+
+```bash
+docs-seed sync --evolution --direct-write --branch develop_V2.1.0 --limit-commits 1
+```
+
+常用查看命令：
+
+```bash
+docs-seed preview branches
+docs-seed preview files
 ```
 
 生成结果默认位于：
