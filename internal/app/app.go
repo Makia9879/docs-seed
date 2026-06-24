@@ -55,20 +55,29 @@ func Init(root string, workspace bool) error {
 
 func (a *App) SyncBranches(ctx context.Context, fetch bool) (model.BranchGraph, error) {
 	if fetch {
+		done := traceStep("git fetch")
 		if err := a.Repo.Fetch(ctx, a.Config.Branches.Remote); err != nil {
+			done()
 			return model.BranchGraph{}, err
 		}
+		done()
 	}
+	done := traceStep("构建分支谱系")
 	graph, err := a.Repo.BuildGraph(ctx, a.Config.Branches)
 	if err != nil {
+		done()
 		return model.BranchGraph{}, err
 	}
+	done()
 	if err := storage.Ensure(a.Root); err != nil {
 		return model.BranchGraph{}, err
 	}
+	done = traceStep("保存分支谱系")
 	if err := storage.SaveGraph(a.Root, graph); err != nil {
+		done()
 		return model.BranchGraph{}, err
 	}
+	done()
 	return graph, nil
 }
 
@@ -98,29 +107,42 @@ func (a *App) LearnNode(ctx context.Context, node model.BranchNode, force bool, 
 	var files []string
 	var err error
 	if mode == "full" {
+		done := traceStep("  收集全量文件")
 		files, err = a.Repo.AllFiles(ctx, node.Tip)
+		done()
 	} else {
+		done := traceStep("  收集增量文件")
 		files, err = a.Repo.ChangedFiles(ctx, base, node.Tip)
+		done()
 	}
 	if err != nil {
 		return model.Fact{}, false, err
 	}
 	files = filterFiles(files, a.Config.Exclude)
+	done := traceStep("  读取提交日志")
 	logText, err := a.Repo.Log(ctx, base, node.Tip)
 	if err != nil {
+		done()
 		return model.Fact{}, false, err
 	}
+	done()
+	done = traceStep("  创建源码快照")
 	snapshot, cleanup, err := a.Repo.Snapshot(ctx, node.Tip)
 	if err != nil {
+		done()
 		return model.Fact{}, false, err
 	}
+	done()
 	defer cleanup()
 
 	prompt := buildPrompt(a.Config, node, mode, base, files, logText, history)
+	done = traceStep("  Agent 生成分支事实")
 	fact, err := a.Generator.Generate(ctx, snapshot, prompt)
 	if err != nil {
+		done()
 		return model.Fact{}, false, err
 	}
+	done()
 	fact.Version = 1
 	fact.Branch = node.Name
 	fact.Parent = node.Parent
@@ -131,9 +153,12 @@ func (a *App) LearnNode(ctx context.Context, node model.BranchNode, force bool, 
 	if err := validateFact(fact); err != nil {
 		return model.Fact{}, false, err
 	}
+	done = traceStep("  保存分支事实")
 	if err := storage.SaveFact(a.Root, fact); err != nil {
+		done()
 		return model.Fact{}, false, err
 	}
+	done()
 	return fact, true, nil
 }
 
@@ -198,22 +223,31 @@ func (a *App) LearnNodeEvolution(ctx context.Context, node model.BranchNode, for
 			continue
 		}
 		fmt.Printf("%s - 分析中，变更文件 %d 个\n", prefix, len(filteredFiles))
+		done := traceStep("    读取 commit diff")
 		diff, err := a.Repo.Diff(ctx, commit.Parent, commit.Hash, 120000)
 		if err != nil {
+			done()
 			return model.Fact{}, false, err
 		}
+		done()
 		commit.Files = filteredFiles
 		commit.Diff = diff
+		done = traceStep("    创建 commit 快照")
 		snapshot, cleanup, err := a.Repo.Snapshot(ctx, commit.Hash)
 		if err != nil {
+			done()
 			return model.Fact{}, false, err
 		}
+		done()
 		prompt := buildCommitPrompt(node, mode, base, commit)
+		done = traceStep("    Agent 分析 commit")
 		fact, err := a.Generator.Generate(ctx, snapshot, prompt)
 		cleanup()
 		if err != nil {
+			done()
 			return model.Fact{}, false, fmt.Errorf("分析提交 %s: %w", short(commit.Hash), err)
 		}
+		done()
 		fact.Version = 1
 		fact.Branch = node.Name
 		fact.Parent = node.Parent
@@ -228,9 +262,12 @@ func (a *App) LearnNodeEvolution(ctx context.Context, node model.BranchNode, for
 			Version: 1, Branch: node.Name, Commit: commit, Fact: fact,
 			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		}
+		done = traceStep("    保存 commit 事实")
 		if err := storage.SaveCommitFact(a.Root, cf); err != nil {
+			done()
 			return model.Fact{}, false, err
 		}
+		done()
 		fmt.Printf("%s - 完成\n", prefix)
 		commitFacts = append(commitFacts, cf)
 	}
@@ -290,13 +327,17 @@ func (a *App) GenerateChain(chain []model.BranchNode) error {
 }
 
 func (a *App) Sync(ctx context.Context, selected string, force bool, evolution bool, directWrite bool, directLimit int) error {
+	defer traceStep("docs-seed sync 总耗时")()
 	if len(a.Config.Workspace.Projects) > 0 {
 		return a.SyncWorkspace(ctx, force, evolution, directWrite, directLimit)
 	}
+	done := traceStep("检查工作树状态")
 	dirty, err := a.Repo.IsDirty(ctx)
 	if err != nil {
+		done()
 		return err
 	}
+	done()
 	if dirty {
 		fmt.Println("警告：工作树存在未提交修改；文档只基于已提交的分支 tip 生成。")
 	}
@@ -305,10 +346,13 @@ func (a *App) Sync(ctx context.Context, selected string, force bool, evolution b
 	if err != nil {
 		return err
 	}
+	done = traceStep("计算阅读链路")
 	chain, err := a.CurrentChain(ctx, graph, selected)
 	if err != nil {
+		done()
 		return err
 	}
+	done()
 	fmt.Printf("阅读链路：%s\n", chainNames(chain))
 	if directWrite {
 		fmt.Println("启用 direct-write：Agent 将直接写 Markdown 文档，主进程不解析 JSON。")
@@ -406,18 +450,27 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		if node.Parent != "" {
 			mode, base = "incremental", node.ForkPoint
 		}
+		done := traceStep("  读取分支提交列表")
 		commits, err := a.Repo.Commits(ctx, base, node.Tip)
 		if err != nil {
+			done()
 			return err
 		}
+		done()
 		fmt.Printf("[%d/%d] direct-write 分支 %s，提交数 %d\n", i+1, len(chain), node.Name, len(commits))
+		done = traceStep("  确保 direct-write 文档骨架")
 		if err := ensureDirectBranchSkeleton(output, node, mode, base, chain); err != nil {
+			done()
 			return err
 		}
+		done()
 		updateDirectCheckpointBranch(&checkpoint, node, mode, base, chain)
+		done = traceStep("  保存 direct-write 存档点")
 		if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+			done()
 			return err
 		}
+		done()
 		for j, commit := range commits {
 			prefix := fmt.Sprintf("  [%d/%d] %s %s", j+1, len(commits), short(commit.Hash), commit.Subject)
 			commit.Files = filterFiles(commit.Files, a.Config.Exclude)
@@ -447,31 +500,49 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				continue
 			}
 			fmt.Printf("%s - 写入材料并指挥 Agent 更新文档，变更文件 %d 个\n", prefix, len(commit.Files))
+			done := traceStep("    读取 direct-write 当前文档")
 			before, err := snapshotDirectDocs(dir)
 			if err != nil {
+				done()
 				return err
 			}
+			done()
+			done = traceStep("    读取 commit diff")
 			diff, err := a.Repo.Diff(ctx, commit.Parent, commit.Hash, 120000)
 			if err != nil {
+				done()
 				return err
 			}
+			done()
 			commit.Diff = diff
+			done = traceStep("    写入 direct-write 材料")
 			material, err := writeDirectWriteCommitMaterial(a.Root, output, node, mode, base, chain, commit, j+1, len(commits))
 			if err != nil {
+				done()
 				return err
 			}
+			done()
 			prompt := buildDirectWriteCommitPrompt(output, node, mode, base, chain, material, commit, j+1, len(commits))
+			done = traceStep("    Agent 直写文档")
 			outputText, err := a.Generator.Write(ctx, dir, prompt, a.Root)
 			if err != nil {
+				done()
 				return fmt.Errorf("direct-write 分支 %s 提交 %s: %w", node.Name, short(commit.Hash), err)
 			}
+			done()
+			done = traceStep("    校验 direct-write 结果")
 			if err := validateDirectWriteResult(dir, commit, before, recordedInDoc); err != nil {
+				done()
 				return fmt.Errorf("direct-write 分支 %s 提交 %s: %w\nAgent 输出：%s", node.Name, short(commit.Hash), err, trimForError(outputText, 2000))
 			}
+			done()
 			markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "agent")
+			done = traceStep("    保存 direct-write 存档点")
 			if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+				done()
 				return err
 			}
+			done()
 			processed++
 			fmt.Printf("%s - 完成，已沉淀到 %s\n", prefix, dir)
 			if limit > 0 && processed >= limit {
@@ -482,6 +553,14 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		fmt.Printf("[%d/%d] direct-write 完成 %s\n", i+1, len(chain), node.Name)
 	}
 	return ensureDirectRootIndex(output, chain)
+}
+
+func traceStep(label string) func() {
+	start := time.Now()
+	fmt.Printf("[timer] %s...\n", label)
+	return func() {
+		fmt.Printf("[timer] %s 完成，用时 %s\n", label, time.Since(start).Round(time.Millisecond))
+	}
 }
 
 func buildPrompt(cfg config.Config, node model.BranchNode, mode, base string, files []string, logText string, history bool) string {

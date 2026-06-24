@@ -51,9 +51,12 @@ func (r Runner) Generate(ctx context.Context, workDir, prompt string) (model.Fac
 	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	start := time.Now()
+	fmt.Printf("      agent %s generate start: dir=%s timeout=%s\n", r.Config.Engine, workDir, timeout)
 	if err := cmd.Run(); err != nil {
 		return model.Fact{}, fmt.Errorf("调用 %s 失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
 	}
+	fmt.Printf("      agent %s generate done: %s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond))
 	content := extractContent(r.Config.Engine, stdout.String())
 	var fact model.Fact
 	if err := json.Unmarshal([]byte(extractJSONObject(content)), &fact); err != nil {
@@ -104,9 +107,12 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	start := time.Now()
+	fmt.Printf("      agent %s write start: dir=%s timeout=%s\n", r.Config.Engine, workDir, timeout)
 	if err := cmd.Run(); err != nil {
 		return stdout.String(), fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, combinedOutput(stderr.String(), stdout.String()))
 	}
+	fmt.Printf("      agent %s write done: %s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond))
 	return stdout.String(), nil
 }
 
