@@ -160,6 +160,40 @@ docs-seed preview files
 
 ## 命令
 
+### 命令关系
+
+`sync` 是面向日常使用的编排命令：它会先同步分支谱系，再执行对应的学习流程，最后
+把已学习事实落成 Markdown 文档。需要拆开调试时，可以分别运行 `branches sync`、
+`learn ...` 和 `generate docs`。
+
+```mermaid
+flowchart TD
+    A["手动拆分执行"] --> B["docs-seed branches sync<br/>拉取远端 refs，重建 branch-graph.json"]
+    B --> C["计算当前或指定分支的阅读链路"]
+    C --> D{"选择 learn 命令"}
+    D -->|current/history| E["docs-seed learn current/history<br/>只学习当前链路最后一个分支"]
+    D -->|evolution| F["docs-seed learn evolution<br/>按阅读链路逐分支、逐 commit 学习"]
+    E --> G[".docs-seed/state/<br/>保存分支事实缓存"]
+    F --> G
+    G --> H["docs-seed generate docs<br/>从事实缓存生成 Markdown 文档"]
+    H --> I["最终 Markdown 文档<br/>business-logic / data-flow / adr / commit-evolution"]
+
+    J["docs-seed sync"] --> K["同步分支谱系"]
+    K --> L["计算当前或指定分支的阅读链路"]
+    L --> M{"是否带 --evolution?"}
+    M -->|否| N["LearnChain(history=true)<br/>学习整条阅读链路"]
+    M -->|是| O["LearnChainEvolution<br/>逐 commit 学习整条阅读链路"]
+    N --> P["保存事实缓存"]
+    O --> P
+    P --> Q["GenerateChain<br/>从事实缓存生成 Markdown 文档"]
+    Q --> I
+
+    R["docs-seed sync --evolution --direct-write"] --> S["同步分支谱系"]
+    S --> T["计算当前或指定分支的阅读链路"]
+    T --> U["GenerateChainDirect<br/>每个 commit 写材料文件并让 Agent 直接更新 Markdown"]
+    U --> I
+```
+
 | 命令 | 作用 |
 |---|---|
 | `docs-seed init` | 创建 `.docs-seed.yml` 和状态目录 |
