@@ -292,12 +292,15 @@ func Chain(graph model.BranchGraph, branch string) ([]model.BranchNode, error) {
 }
 
 func (r Repository) ChangedFiles(ctx context.Context, base, head string) ([]string, error) {
-	args := []string{"diff", "--name-only", "--diff-filter=ACMRT"}
-	if base != "" {
-		args = append(args, base+".."+head)
-	} else {
-		args = append(args, head+"^!", "--root")
+	if base == "" {
+		out, err := r.run(ctx, "show", "--root", "--format=", "--name-only", "--diff-filter=ACMRT", head)
+		if err != nil {
+			return nil, err
+		}
+		return nonEmptyLines(out), nil
 	}
+	args := []string{"diff", "--name-only", "--diff-filter=ACMRT"}
+	args = append(args, base+".."+head)
 	out, err := r.run(ctx, args...)
 	if err != nil {
 		return nil, err
@@ -363,12 +366,18 @@ func (r Repository) Commits(ctx context.Context, base, head string) ([]model.Com
 }
 
 func (r Repository) Diff(ctx context.Context, base, head string, maxBytes int) (string, error) {
-	args := []string{"diff", "--find-renames", "--stat", "--patch", "--diff-filter=ACMRT"}
-	if base != "" {
-		args = append(args, base+".."+head)
-	} else {
-		args = append(args, head+"^!", "--root")
+	if base == "" {
+		out, err := r.run(ctx, "show", "--root", "--find-renames", "--stat", "--patch", "--diff-filter=ACMRT", "--format=fuller", head)
+		if err != nil {
+			return "", err
+		}
+		if maxBytes > 0 && len(out) > maxBytes {
+			return out[:maxBytes] + "\n\n[docs-seed: diff truncated]\n", nil
+		}
+		return out, nil
 	}
+	args := []string{"diff", "--find-renames", "--stat", "--patch", "--diff-filter=ACMRT"}
+	args = append(args, base+".."+head)
 	out, err := r.run(ctx, args...)
 	if err != nil {
 		return "", err

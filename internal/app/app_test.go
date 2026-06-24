@@ -32,8 +32,9 @@ func (fakeGenerator) Generate(_ context.Context, _ string, prompt string) (model
 	}, nil
 }
 
-func (fakeGenerator) Write(_ context.Context, workDir, prompt string) error {
-	output := filepath.Join(workDir, ".docs-seed", "docs", "branches", "main")
+func (fakeGenerator) Write(_ context.Context, workDir, prompt string, _ ...string) (string, error) {
+	output := workDir
+	hash := "unknown"
 	if strings.Contains(prompt, "写入目录：") {
 		for _, line := range strings.Split(prompt, "\n") {
 			line = strings.TrimSpace(line)
@@ -43,15 +44,48 @@ func (fakeGenerator) Write(_ context.Context, workDir, prompt string) error {
 			}
 		}
 	}
-	if err := os.MkdirAll(output, 0o755); err != nil {
-		return err
-	}
-	for _, name := range []string{"README.md", "business-logic.md", "data-flow.md", "adr.md", "commit-evolution.md"} {
-		if err := os.WriteFile(filepath.Join(output, name), []byte("# "+name+"\n"), 0o644); err != nil {
-			return err
+	if strings.Contains(prompt, "当前 commit：") {
+		for _, line := range strings.Split(prompt, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "当前 commit：") {
+				fields := strings.Fields(strings.TrimPrefix(line, "当前 commit："))
+				if len(fields) > 0 {
+					hash = fields[0]
+				}
+				break
+			}
 		}
 	}
-	return nil
+	if err := os.MkdirAll(output, 0o755); err != nil {
+		return "", err
+	}
+	for _, name := range []string{"README.md", "business-logic.md", "data-flow.md", "adr.md"} {
+		if err := os.WriteFile(filepath.Join(output, name), []byte("# "+name+"\n\nprocessed "+hash+"\n"), 0o644); err != nil {
+			return "", err
+		}
+	}
+	return "written", os.WriteFile(filepath.Join(output, "commit-evolution.md"), []byte("# commit-evolution.md\n\n## "+hash+" root business\n\n- 业务演进事实。\n"), 0o644)
+}
+
+type noOpWriteGenerator struct {
+	fakeGenerator
+}
+
+func (noOpWriteGenerator) Write(_ context.Context, _ string, _ string, _ ...string) (string, error) {
+	return "I did not edit files.", nil
+}
+
+type countingWriteGenerator struct {
+	count int
+}
+
+func (g *countingWriteGenerator) Generate(ctx context.Context, workDir, prompt string) (model.Fact, error) {
+	return fakeGenerator{}.Generate(ctx, workDir, prompt)
+}
+
+func (g *countingWriteGenerator) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {
+	g.count++
+	return fakeGenerator{}.Write(ctx, workDir, prompt, addDirs...)
 }
 
 func TestLearnAndGenerateCurrentChain(t *testing.T) {
@@ -166,11 +200,66 @@ func TestGenerateChainDirectWritesDocumentsWithoutParsingJSON(t *testing.T) {
 	require.NoError(t, err)
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
-	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain))
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
 
 	output := filepath.Join(root, ".docs-seed", "docs", "branches", "main")
 	require.FileExists(t, filepath.Join(output, "README.md"))
-	require.FileExists(t, filepath.Join(output, "commit-evolution.md"))
+	evolution := readFile(t, filepath.Join(output, "commit-evolution.md"))
+	require.Contains(t, evolution, "root business")
+	checkpoint := readFile(t, filepath.Join(root, ".docs-seed", "docs", directCheckpointFile))
+	require.Contains(t, checkpoint, "root business")
+	require.Contains(t, checkpoint, "processed_commits")
+}
+
+func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	writeFile(t, root, "service/order.go", "package service\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "root business")
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: noOpWriteGenerator{},
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	err = instance.GenerateChainDirect(context.Background(), chain, 0)
+	require.ErrorContains(t, err, "Agent 未在 commit-evolution.md 记录当前提交")
+}
+
+func TestGenerateChainDirectResumesFromCheckpointAndExistingDocs(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	writeFile(t, root, "service/order.go", "package service\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "root business")
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
+	require.Equal(t, 1, generator.count)
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0))
+	require.Equal(t, 1, generator.count)
 }
 
 func runGit(t *testing.T, root string, args ...string) {

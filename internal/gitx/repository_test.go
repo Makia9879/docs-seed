@@ -111,7 +111,7 @@ func TestRootParentOverrideWins(t *testing.T) {
 	}
 }
 
-func TestCommitsReturnsReverseChronologicalRangeWithFiles(t *testing.T) {
+func TestCommitsReturnsChronologicalRangeWithFiles(t *testing.T) {
 	root := t.TempDir()
 	git(t, root, "init", "-b", "main")
 	git(t, root, "config", "user.email", "docs-seed@example.com")
@@ -136,6 +136,29 @@ func TestCommitsReturnsReverseChronologicalRangeWithFiles(t *testing.T) {
 	require.Contains(t, commits[1].Files, "more.txt")
 }
 
+func TestCommitsIncludesRootCommitFilesAndDiff(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-b", "main")
+	git(t, root, "config", "user.email", "docs-seed@example.com")
+	git(t, root, "config", "user.name", "Docs Seed")
+	write(t, root, "desc/api/order.api", "type Order {}\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-m", "root business")
+	head := gitOutput(t, root, "rev-parse", "HEAD")
+
+	repo := Repository{Root: root}
+	commits, err := repo.Commits(context.Background(), "", head)
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	require.Equal(t, "root business", commits[0].Subject)
+	require.Contains(t, commits[0].Files, "desc/api/order.api")
+
+	diff, err := repo.Diff(context.Background(), "", head, 0)
+	require.NoError(t, err)
+	require.Contains(t, diff, "desc/api/order.api")
+	require.Contains(t, diff, "type Order")
+}
+
 func git(t *testing.T, root string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -155,5 +178,7 @@ func gitOutput(t *testing.T, root string, args ...string) string {
 
 func write(t *testing.T, root, name, content string) {
 	t.Helper()
-	require.NoError(t, os.WriteFile(filepath.Join(root, name), []byte(content), 0o644))
+	path := filepath.Join(root, name)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 }

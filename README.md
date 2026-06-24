@@ -153,9 +153,28 @@ docs-seed sync --evolution --direct-write --branch <target>
 ```
 
 direct-write 模式下，Docs Seed 不再解析 Agent 返回的 JSON。它把分支链路、commit
-message、变更文件和 diff 交给 Claude/Codex，由 Agent 直接写
+message、变更文件和 diff 写入 `.docs-seed/tmp/direct-write/` 的单提交材料文件，
+再指挥 Claude/Codex 读取该材料文件并直接写
 `business-logic.md`、`data-flow.md`、`adr.md` 和 `commit-evolution.md`。主进程只
-负责 Git 范围、进度回显和根索引生成。
+负责 Git 范围、进度回显、结果校验和根索引生成。每个有效提交处理后，
+`commit-evolution.md` 必须包含该 commit 的完整 hash 或短 hash；否则本次同步会失败，
+避免 Agent 没有真正更新最终文档却继续向后处理。
+
+direct-write 的恢复存档保存在最终文档根目录：
+
+```text
+<docs.output>/docs-seed-checkpoint.json
+```
+
+每次运行都会重新计算当前阅读链路和各分支段的提交集合，再用存档点和最终
+`commit-evolution.md` 共同判断是否跳过。只有“存档点已记录且最终文档也包含该 commit
+hash”的提交才会跳过；如果最终文档已有记录但存档点缺失，Docs Seed 会补写存档点。
+
+调试 Agent 写入行为时可以限制处理数量：
+
+```bash
+docs-seed sync --evolution --direct-write --branch <target> --limit-commits 1
+```
 
 ## 开发验证
 

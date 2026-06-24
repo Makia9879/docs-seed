@@ -289,9 +289,9 @@ func (a *App) GenerateChain(chain []model.BranchNode) error {
 	return writeRootIndex(output, chain)
 }
 
-func (a *App) Sync(ctx context.Context, selected string, force bool, evolution bool, directWrite bool) error {
+func (a *App) Sync(ctx context.Context, selected string, force bool, evolution bool, directWrite bool, directLimit int) error {
 	if len(a.Config.Workspace.Projects) > 0 {
-		return a.SyncWorkspace(ctx, force, evolution, directWrite)
+		return a.SyncWorkspace(ctx, force, evolution, directWrite, directLimit)
 	}
 	dirty, err := a.Repo.IsDirty(ctx)
 	if err != nil {
@@ -312,7 +312,7 @@ func (a *App) Sync(ctx context.Context, selected string, force bool, evolution b
 	fmt.Printf("阅读链路：%s\n", chainNames(chain))
 	if directWrite {
 		fmt.Println("启用 direct-write：Agent 将直接写 Markdown 文档，主进程不解析 JSON。")
-		return a.GenerateChainDirect(ctx, chain)
+		return a.GenerateChainDirect(ctx, chain, directLimit)
 	}
 	if evolution {
 		if _, err := a.LearnChainEvolution(ctx, chain, force); err != nil {
@@ -367,7 +367,7 @@ func (a *App) AddWorkspaceProjects(paths []string) ([]string, error) {
 	return added, config.Save(a.Root, a.Config)
 }
 
-func (a *App) SyncWorkspace(ctx context.Context, force bool, evolution bool, directWrite bool) error {
+func (a *App) SyncWorkspace(ctx context.Context, force bool, evolution bool, directWrite bool, directLimit int) error {
 	var lines []string
 	for _, project := range a.Config.Workspace.Projects {
 		full := filepath.Join(a.Root, project)
@@ -375,7 +375,7 @@ func (a *App) SyncWorkspace(ctx context.Context, force bool, evolution bool, dir
 		if err != nil {
 			return fmt.Errorf("打开子项目 %s: %w", project, err)
 		}
-		if err := child.Sync(ctx, "", force, evolution, directWrite); err != nil {
+		if err := child.Sync(ctx, "", force, evolution, directWrite, directLimit); err != nil {
 			return fmt.Errorf("同步子项目 %s: %w", project, err)
 		}
 		lines = append(lines, fmt.Sprintf("- [%s](../../%s/%s/README.md)", project, project, child.Config.Docs.Output))
@@ -388,7 +388,7 @@ func (a *App) SyncWorkspace(ctx context.Context, force bool, evolution bool, dir
 	return storage.AtomicWrite(filepath.Join(output, "README.md"), []byte(body))
 }
 
-func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode) error {
+func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode, limit int) error {
 	output := a.Config.Docs.Output
 	if !filepath.IsAbs(output) {
 		output = filepath.Join(a.Root, output)
@@ -396,6 +396,11 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode)
 	if err := os.MkdirAll(output, 0o755); err != nil {
 		return err
 	}
+	checkpoint, err := loadDirectCheckpoint(output)
+	if err != nil {
+		return err
+	}
+	processed := 0
 	for i, node := range chain {
 		mode, base := "full", ""
 		if node.Parent != "" {
@@ -405,18 +410,74 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode)
 		if err != nil {
 			return err
 		}
-		for j := range commits {
-			commits[j].Files = filterFiles(commits[j].Files, a.Config.Exclude)
-			diff, err := a.Repo.Diff(ctx, commits[j].Parent, commits[j].Hash, 120000)
+		fmt.Printf("[%d/%d] direct-write 分支 %s，提交数 %d\n", i+1, len(chain), node.Name, len(commits))
+		if err := ensureDirectBranchSkeleton(output, node, mode, base, chain); err != nil {
+			return err
+		}
+		updateDirectCheckpointBranch(&checkpoint, node, mode, base, chain)
+		if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+			return err
+		}
+		for j, commit := range commits {
+			prefix := fmt.Sprintf("  [%d/%d] %s %s", j+1, len(commits), short(commit.Hash), commit.Subject)
+			commit.Files = filterFiles(commit.Files, a.Config.Exclude)
+			if len(commit.Files) == 0 {
+				fmt.Printf("%s - 跳过，无有效业务文件变化\n", prefix)
+				continue
+			}
+			fmt.Printf("%s - 写入材料并指挥 Agent 更新文档，变更文件 %d 个\n", prefix, len(commit.Files))
+			dir := storage.BranchDocDir(output, node.Name)
+			recordedInDoc, err := directCommitRecorded(dir, commit)
 			if err != nil {
 				return err
 			}
-			commits[j].Diff = diff
-		}
-		fmt.Printf("[%d/%d] direct-write 分支 %s，提交数 %d\n", i+1, len(chain), node.Name, len(commits))
-		prompt := buildDirectWritePrompt(output, node, mode, base, chain, commits)
-		if err := a.Generator.Write(ctx, a.Root, prompt); err != nil {
-			return fmt.Errorf("direct-write 分支 %s: %w", node.Name, err)
+			recordedInCheckpoint := directCheckpointHas(checkpoint, node.Name, commit.Hash)
+			if recordedInCheckpoint && recordedInDoc {
+				fmt.Printf("%s - 跳过，存档点已记录且最终文档已沉淀\n", prefix)
+				continue
+			}
+			if recordedInCheckpoint && !recordedInDoc {
+				fmt.Printf("%s - 存档点已记录但最终文档缺少该提交，重新处理\n", prefix)
+			}
+			if !recordedInCheckpoint && recordedInDoc {
+				fmt.Printf("%s - 最终文档已有记录，补写存档点\n", prefix)
+				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "existing-doc")
+				if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+					return err
+				}
+				continue
+			}
+			before, err := snapshotDirectDocs(dir)
+			if err != nil {
+				return err
+			}
+			diff, err := a.Repo.Diff(ctx, commit.Parent, commit.Hash, 120000)
+			if err != nil {
+				return err
+			}
+			commit.Diff = diff
+			material, err := writeDirectWriteCommitMaterial(a.Root, output, node, mode, base, chain, commit, j+1, len(commits))
+			if err != nil {
+				return err
+			}
+			prompt := buildDirectWriteCommitPrompt(output, node, mode, base, chain, material, commit, j+1, len(commits))
+			outputText, err := a.Generator.Write(ctx, dir, prompt, a.Root)
+			if err != nil {
+				return fmt.Errorf("direct-write 分支 %s 提交 %s: %w", node.Name, short(commit.Hash), err)
+			}
+			if err := validateDirectWriteResult(dir, commit, before, recordedInDoc); err != nil {
+				return fmt.Errorf("direct-write 分支 %s 提交 %s: %w\nAgent 输出：%s", node.Name, short(commit.Hash), err, trimForError(outputText, 2000))
+			}
+			markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "agent")
+			if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+				return err
+			}
+			processed++
+			fmt.Printf("%s - 完成，已沉淀到 %s\n", prefix, dir)
+			if limit > 0 && processed >= limit {
+				fmt.Printf("direct-write 已达到 --limit-commits=%d，提前停止。\n", limit)
+				return ensureDirectRootIndex(output, chain)
+			}
 		}
 		fmt.Printf("[%d/%d] direct-write 完成 %s\n", i+1, len(chain), node.Name)
 	}
@@ -491,7 +552,68 @@ Diff：
 `, node.Name, scope, commit.Hash, commit.Timestamp, commit.Subject, bulletList(commit.Files), commit.Diff)
 }
 
-func buildDirectWritePrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, commits []model.Commit) string {
+func ensureDirectBranchSkeleton(output string, node model.BranchNode, mode, base string, chain []model.BranchNode) error {
+	dir := storage.BranchDocDir(output, node.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	readme := fmt.Sprintf(`# %s
+
+- 文档类型：%s
+- 父主分支：%s
+- 提交范围：%s
+- 阅读链路：%s
+
+本目录由 docs-seed direct-write 模式按提交顺序滚动更新。
+
+- [业务逻辑](./business-logic.md)
+- [数据流转](./data-flow.md)
+- [ADR](./adr.md)
+- [提交演进](./commit-evolution.md)
+`, node.Name, map[string]string{"full": "全量基线", "incremental": "相对父主分支的增量"}[mode], emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain))
+	files := map[string]string{
+		"README.md":           readme,
+		"business-logic.md":   "# " + node.Name + "：业务逻辑\n\n",
+		"data-flow.md":        "# " + node.Name + "：数据流转\n\n",
+		"adr.md":              "# " + node.Name + "：ADR\n\n",
+		"commit-evolution.md": "# " + node.Name + "：提交演进\n\n",
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			if err := storage.AtomicWrite(path, []byte(content)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func writeDirectWriteCommitMaterial(root, output string, node model.BranchNode, mode, base string, chain []model.BranchNode, commit model.Commit, index, total int) (string, error) {
+	dir := filepath.Join(storage.StateDir(root), "tmp", "direct-write")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%04d-%s.md", strings.ReplaceAll(node.Name, "/", "__"), index, short(commit.Hash)))
+	var body strings.Builder
+	fmt.Fprintf(&body, "# docs-seed direct-write commit material: %s %d/%d\n\n", node.Name, index, total)
+	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
+	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
+		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
+	fmt.Fprintf(&body, "commit_index: %d\ncommit_total: %d\n\n", index, total)
+	fmt.Fprintf(&body, "hash: %s\nparent: %s\ntime: %s\nsubject: %s\n", commit.Hash, commit.Parent, commit.Timestamp, commit.Subject)
+	if commit.Body != "" {
+		fmt.Fprintf(&body, "body:\n%s\n", commit.Body)
+	}
+	fmt.Fprintf(&body, "files:\n%s\n", bulletList(commit.Files))
+	fmt.Fprintf(&body, "diff:\n%s\n", commit.Diff)
+	if err := storage.AtomicWrite(path, []byte(body.String())); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, commit model.Commit, index, total int) string {
 	dir := storage.BranchDocDir(output, node.Name)
 	modeLabel := "全量基线"
 	scope := "从该分支可达历史的第一个提交开始，按提交顺序总结业务演进"
@@ -499,24 +621,19 @@ func buildDirectWritePrompt(output string, node model.BranchNode, mode, base str
 		modeLabel = "相对父主分支的增量"
 		scope = fmt.Sprintf("只总结相对父主分支 %s、从 %s 到 %s 的增量业务演进", node.Parent, short(base), short(node.Tip))
 	}
-	var commitText strings.Builder
-	for i, commit := range commits {
-		fmt.Fprintf(&commitText, "\n### Commit %d/%d\n", i+1, len(commits))
-		fmt.Fprintf(&commitText, "hash: %s\nparent: %s\ntime: %s\nsubject: %s\n", commit.Hash, commit.Parent, commit.Timestamp, commit.Subject)
-		if commit.Body != "" {
-			fmt.Fprintf(&commitText, "body:\n%s\n", commit.Body)
-		}
-		fmt.Fprintf(&commitText, "files:\n%s\n", bulletList(commit.Files))
-		fmt.Fprintf(&commitText, "diff:\n%s\n", commit.Diff)
-	}
-	return fmt.Sprintf(`你是 docs-seed 的文档生成 Agent。请直接在当前仓库写 Markdown 文件，不要向 stdout 输出 JSON。
+	return fmt.Sprintf(`你是 docs-seed 的滚动文档生成 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
 
-任务：为主分支 %q 生成人类阅读文档。
+任务：处理主分支 %q 的第 %d/%d 个 commit，并基于已有文档滚动更新结果。
+
+当前 commit：%s %s
+
+重要：本次 commit 的详细材料不在本提示词中。请先读取这个材料文件：
+%s
 
 写入目录：%s
-必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
+当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
 
-必须生成这些文件：
+必须读取并更新这些文件；如果不存在则创建：
 - README.md
 - business-logic.md
 - data-flow.md
@@ -528,6 +645,13 @@ func buildDirectWritePrompt(output string, node model.BranchNode, mode, base str
 - 不写函数签名、类名清单、API 调用示例、CLI 命令、参数说明、安装步骤、代码调用方式、测试方法或代码块。
 - 每条结论必须能从提交信息、diff 或当前源码验证。
 - evidence 只写仓库相对文件路径和简短证据说明，不写行号或调用步骤。
+
+滚动更新规则：
+- 本次只根据材料文件中的当前 commit 更新文档。
+- 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；没有业务影响则不要强行新增。
+- 对 commit-evolution.md：必须追加或更新一个当前 commit 小节，小节标题必须包含完整 hash %s 或短 hash %s；即使当前 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
+- 不要删除前面 commit 已经总结出的有效内容，除非当前 commit 明确废弃或替代它。
+- 保持文档简洁，合并重复结论。
 
 分支信息：
 - 文档类型：%s
@@ -541,11 +665,185 @@ func buildDirectWritePrompt(output string, node model.BranchNode, mode, base str
 - business-logic.md：按业务能力总结最终分支事实。
 - data-flow.md：按数据入口、处理、持久化、外部流出总结。
 - adr.md：写已经发生的架构决策、取舍、后果。
-- commit-evolution.md：按下面提交顺序逐 commit 记录业务演进事实。
+- commit-evolution.md：按提交顺序逐 commit 记录业务演进事实。
 
-提交材料如下：
-%s
-`, node.Name, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope, commitText.String())
+现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
+`, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+}
+
+func snapshotDirectDocs(dir string) (map[string]string, error) {
+	snapshot := map[string]string{}
+	for _, name := range directDocNames() {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				snapshot[name] = ""
+				continue
+			}
+			return nil, err
+		}
+		snapshot[name] = string(data)
+	}
+	return snapshot, nil
+}
+
+func validateDirectWriteResult(dir string, commit model.Commit, before map[string]string, beforeRecorded bool) error {
+	after, err := snapshotDirectDocs(dir)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, name := range directDocNames() {
+		if after[name] != before[name] {
+			changed = true
+			break
+		}
+	}
+	recorded, err := directCommitRecorded(dir, commit)
+	if err != nil {
+		return err
+	}
+	if !recorded {
+		return fmt.Errorf("Agent 未在 commit-evolution.md 记录当前提交 %s；请检查提示词或 Agent 写文件权限", short(commit.Hash))
+	}
+	if !changed && !beforeRecorded {
+		return fmt.Errorf("Agent 没有修改任何结果文档；当前提交 %s 未沉淀到最终文档", short(commit.Hash))
+	}
+	return nil
+}
+
+func directCommitRecorded(dir string, commit model.Commit) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "commit-evolution.md"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	text := string(data)
+	return strings.Contains(text, commit.Hash) || strings.Contains(text, short(commit.Hash)), nil
+}
+
+func directDocNames() []string {
+	return []string{"README.md", "business-logic.md", "data-flow.md", "adr.md", "commit-evolution.md"}
+}
+
+const directCheckpointFile = "docs-seed-checkpoint.json"
+
+type directCheckpoint struct {
+	Version   int                               `json:"version"`
+	UpdatedAt string                            `json:"updated_at"`
+	Chain     []string                          `json:"chain"`
+	Branches  map[string]directCheckpointBranch `json:"branches"`
+}
+
+type directCheckpointBranch struct {
+	Branch          string                            `json:"branch"`
+	Parent          string                            `json:"parent,omitempty"`
+	Mode            string                            `json:"mode"`
+	BaseCommit      string                            `json:"base_commit,omitempty"`
+	HeadCommit      string                            `json:"head_commit"`
+	CommitTotal     int                               `json:"commit_total,omitempty"`
+	LastProcessed   string                            `json:"last_processed_commit,omitempty"`
+	LastProcessedAt string                            `json:"last_processed_at,omitempty"`
+	Processed       map[string]directCheckpointCommit `json:"processed_commits"`
+}
+
+type directCheckpointCommit struct {
+	Hash        string `json:"hash"`
+	ShortHash   string `json:"short_hash"`
+	Subject     string `json:"subject"`
+	Index       int    `json:"index"`
+	Total       int    `json:"total"`
+	Source      string `json:"source"`
+	ProcessedAt string `json:"processed_at"`
+}
+
+func loadDirectCheckpoint(output string) (directCheckpoint, error) {
+	path := filepath.Join(output, directCheckpointFile)
+	checkpoint := directCheckpoint{
+		Version:  1,
+		Branches: map[string]directCheckpointBranch{},
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return checkpoint, nil
+		}
+		return directCheckpoint{}, err
+	}
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return directCheckpoint{}, fmt.Errorf("解析存档点 %s: %w", path, err)
+	}
+	if checkpoint.Version == 0 {
+		checkpoint.Version = 1
+	}
+	if checkpoint.Branches == nil {
+		checkpoint.Branches = map[string]directCheckpointBranch{}
+	}
+	return checkpoint, nil
+}
+
+func saveDirectCheckpoint(output string, checkpoint directCheckpoint) error {
+	checkpoint.Version = 1
+	checkpoint.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	data, err := json.MarshalIndent(checkpoint, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return storage.AtomicWrite(filepath.Join(output, directCheckpointFile), data)
+}
+
+func updateDirectCheckpointBranch(checkpoint *directCheckpoint, node model.BranchNode, mode, base string, chain []model.BranchNode) {
+	if checkpoint.Branches == nil {
+		checkpoint.Branches = map[string]directCheckpointBranch{}
+	}
+	checkpoint.Chain = chainNameSlice(chain)
+	branch := checkpoint.Branches[node.Name]
+	branch.Branch = node.Name
+	branch.Parent = node.Parent
+	branch.Mode = mode
+	branch.BaseCommit = base
+	branch.HeadCommit = node.Tip
+	if branch.Processed == nil {
+		branch.Processed = map[string]directCheckpointCommit{}
+	}
+	checkpoint.Branches[node.Name] = branch
+}
+
+func markDirectCheckpointProcessed(checkpoint *directCheckpoint, node model.BranchNode, mode, base string, chain []model.BranchNode, commit model.Commit, index, total int, source string) {
+	updateDirectCheckpointBranch(checkpoint, node, mode, base, chain)
+	branch := checkpoint.Branches[node.Name]
+	branch.CommitTotal = total
+	now := time.Now().UTC().Format(time.RFC3339)
+	branch.LastProcessed = commit.Hash
+	branch.LastProcessedAt = now
+	branch.Processed[commit.Hash] = directCheckpointCommit{
+		Hash: commit.Hash, ShortHash: short(commit.Hash), Subject: commit.Subject,
+		Index: index, Total: total, Source: source, ProcessedAt: now,
+	}
+	checkpoint.Branches[node.Name] = branch
+}
+
+func directCheckpointHas(checkpoint directCheckpoint, branch, hash string) bool {
+	item, ok := checkpoint.Branches[branch]
+	if !ok || item.Processed == nil {
+		return false
+	}
+	_, ok = item.Processed[hash]
+	return ok
+}
+
+func trimForError(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "<empty>"
+	}
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	return text[:max] + "\n[docs-seed: output truncated]"
 }
 
 func emptyBranchFact(node model.BranchNode, mode, base string) model.Fact {
@@ -782,11 +1080,15 @@ func ensureDirectRootIndex(output string, chain []model.BranchNode) error {
 }
 
 func chainNames(chain []model.BranchNode) string {
+	return strings.Join(chainNameSlice(chain), " -> ")
+}
+
+func chainNameSlice(chain []model.BranchNode) []string {
 	var names []string
 	for _, node := range chain {
 		names = append(names, node.Name)
 	}
-	return strings.Join(names, " -> ")
+	return names
 }
 
 func filterFiles(files, excludes []string) []string {

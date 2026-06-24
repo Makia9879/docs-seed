@@ -17,7 +17,7 @@ import (
 
 type Generator interface {
 	Generate(ctx context.Context, workDir, prompt string) (model.Fact, error)
-	Write(ctx context.Context, workDir, prompt string) error
+	Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error)
 }
 
 type Runner struct {
@@ -65,13 +65,13 @@ func (r Runner) Generate(ctx context.Context, workDir, prompt string) (model.Fac
 	return fact, nil
 }
 
-func (r Runner) Write(ctx context.Context, workDir, prompt string) error {
+func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {
 	command := r.Config.Command[r.Config.Engine]
 	if command == "" {
 		command = r.Config.Engine
 	}
 	if command == "" {
-		return errors.New("agent.engine 未配置")
+		return "", errors.New("agent.engine 未配置")
 	}
 	timeout := time.Duration(r.Config.Timeout) * time.Second
 	if timeout <= 0 {
@@ -85,7 +85,19 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string) error {
 	case "codex":
 		args = []string{"--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "-"}
 	default:
-		args = []string{"--print", "--no-session-persistence", "--disable-slash-commands", "--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit"}
+		args = []string{
+			"--print",
+			"--no-session-persistence",
+			"--disable-slash-commands",
+			"--permission-mode", "acceptEdits",
+			"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit",
+			"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit",
+		}
+		for _, dir := range addDirs {
+			if strings.TrimSpace(dir) != "" {
+				args = append(args, "--add-dir", dir)
+			}
+		}
 	}
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = workDir
@@ -93,9 +105,9 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string) error {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
+		return stdout.String(), fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
 	}
-	return nil
+	return stdout.String(), nil
 }
 
 func extractContent(engine, raw string) string {

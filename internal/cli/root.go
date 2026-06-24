@@ -183,6 +183,7 @@ func syncCommand() *cobra.Command {
 	var force bool
 	var evolution bool
 	var directWrite bool
+	var directLimit int
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "拉取分支、学习当前链路并生成文档",
@@ -191,7 +192,7 @@ func syncCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := instance.Sync(cmd.Context(), branch, force, evolution, directWrite); err != nil {
+			if err := instance.Sync(cmd.Context(), branch, force, evolution, directWrite, directLimit); err != nil {
 				return err
 			}
 			fmt.Println("文档同步完成")
@@ -202,6 +203,7 @@ func syncCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&force, "force", false, "强制重新学习链路")
 	cmd.Flags().BoolVar(&evolution, "evolution", false, "按提交顺序逐步学习业务演进")
 	cmd.Flags().BoolVar(&directWrite, "direct-write", false, "让 Agent 直接写 Markdown 文档，主进程不解析 JSON")
+	cmd.Flags().IntVar(&directLimit, "limit-commits", 0, "direct-write 调试用：最多处理多少个有效提交，0 表示不限制")
 	return cmd
 }
 
