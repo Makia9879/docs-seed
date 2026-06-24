@@ -425,7 +425,6 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				fmt.Printf("%s - 跳过，无有效业务文件变化\n", prefix)
 				continue
 			}
-			fmt.Printf("%s - 写入材料并指挥 Agent 更新文档，变更文件 %d 个\n", prefix, len(commit.Files))
 			dir := storage.BranchDocDir(output, node.Name)
 			recordedInDoc, err := directCommitRecorded(dir, commit)
 			if err != nil {
@@ -447,6 +446,7 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				}
 				continue
 			}
+			fmt.Printf("%s - 写入材料并指挥 Agent 更新文档，变更文件 %d 个\n", prefix, len(commit.Files))
 			before, err := snapshotDirectDocs(dir)
 			if err != nil {
 				return err

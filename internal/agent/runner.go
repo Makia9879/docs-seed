@@ -105,9 +105,24 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, strings.TrimSpace(stderr.String()))
+		return stdout.String(), fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, combinedOutput(stderr.String(), stdout.String()))
 	}
 	return stdout.String(), nil
+}
+
+func combinedOutput(stderrText, stdoutText string) string {
+	stderrText = strings.TrimSpace(stderrText)
+	stdoutText = strings.TrimSpace(stdoutText)
+	switch {
+	case stderrText != "" && stdoutText != "":
+		return "stderr: " + stderrText + "\nstdout: " + stdoutText
+	case stderrText != "":
+		return stderrText
+	case stdoutText != "":
+		return stdoutText
+	default:
+		return "无 stdout/stderr 输出"
+	}
 }
 
 func extractContent(engine, raw string) string {
