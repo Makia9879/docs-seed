@@ -4,3 +4,4 @@
 !/.docs-seed/docs/
 !/.docs-seed/branch-graph.json
 *.log
+docs/direct-write-debugging-handoff.md
