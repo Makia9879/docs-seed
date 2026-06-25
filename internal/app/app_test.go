@@ -551,6 +551,71 @@ func TestDirectRecordAppendsMissingHashes(t *testing.T) {
 	require.Equal(t, 1, strings.Count(text, second))
 }
 
+func TestCompactCommitEvolutionArchivesOldSectionsAndPreservesLookup(t *testing.T) {
+	dir := t.TempDir()
+	hashes := []string{
+		strings.Repeat("a", 40),
+		strings.Repeat("b", 40),
+		strings.Repeat("c", 40),
+	}
+	var body strings.Builder
+	body.WriteString("# main：提交演进\n\n")
+	for i, hash := range hashes {
+		fmt.Fprintf(&body, "## %s commit %d\n\n- fact %d\n\n", hash, i+1, i+1)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "commit-evolution.md"), []byte(body.String()), 0o644))
+
+	require.NoError(t, compactCommitEvolutionDoc(dir, "main", 1))
+
+	active := readFile(t, filepath.Join(dir, "commit-evolution.md"))
+	archive := readFile(t, filepath.Join(dir, "archive", "commit-evolution.md"))
+	require.NotContains(t, active, hashes[0])
+	require.NotContains(t, active, hashes[1])
+	require.Contains(t, active, hashes[2])
+	require.Contains(t, active, "archive/commit-evolution.md")
+	require.Contains(t, archive, hashes[0])
+	require.Contains(t, archive, hashes[1])
+
+	recorded, err := directCommitRecorded(dir, model.Commit{Hash: hashes[0]})
+	require.NoError(t, err)
+	require.True(t, recorded)
+}
+
+func TestSaveDirectCheckpointArchivesOldProcessedCommits(t *testing.T) {
+	output := t.TempDir()
+	hashes := []string{
+		strings.Repeat("a", 40),
+		strings.Repeat("b", 40),
+		strings.Repeat("c", 40),
+	}
+	checkpoint := directCheckpoint{
+		Version: 1,
+		Branches: map[string]directCheckpointBranch{
+			"main": {
+				Branch:    "main",
+				Processed: map[string]directCheckpointCommit{},
+			},
+		},
+	}
+	for i, hash := range hashes {
+		checkpoint.Branches["main"].Processed[hash] = directCheckpointCommit{
+			Hash: hash, ShortHash: short(hash), Subject: fmt.Sprintf("commit %d", i+1), Index: i + 1, Total: len(hashes),
+		}
+	}
+
+	require.NoError(t, saveDirectCheckpoint(output, checkpoint, 1))
+
+	loaded, err := loadDirectCheckpoint(output)
+	require.NoError(t, err)
+	require.True(t, directCheckpointHas(loaded, "main", hashes[0]))
+	require.True(t, directCheckpointHas(loaded, "main", hashes[1]))
+	require.True(t, directCheckpointHas(loaded, "main", hashes[2]))
+	require.Len(t, loaded.Branches["main"].Processed, 1)
+	archive := readFile(t, directCheckpointArchivePath(output, "main"))
+	require.Contains(t, archive, hashes[0])
+	require.Contains(t, archive, hashes[1])
+}
+
 func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
 	oldRetryDelay := retryDelay
 	retryDelay = time.Millisecond

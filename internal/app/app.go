@@ -605,7 +605,7 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		done()
 		updateDirectCheckpointBranch(&checkpoint, node, mode, base, chain)
 		done = traceStep("  保存 direct-write 存档点")
-		if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+		if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
 			done()
 			return err
 		}
@@ -623,11 +623,14 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, item.Commit, item.Index+1, len(commits), "agent")
 			}
 			done := traceStep("    保存 direct-write 存档点")
-			if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+			if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
 				done()
 				return err
 			}
 			done()
+			if err := compactDirectBranch(output, node.Name, a.directKeepRecent()); err != nil {
+				return err
+			}
 			processed += count
 			pending = nil
 			return nil
@@ -664,7 +667,7 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				}
 				fmt.Printf("%s - 最终文档已有记录，补写存档点\n", prefix)
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "existing-doc")
-				if err := saveDirectCheckpoint(output, checkpoint); err != nil {
+				if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
 					return err
 				}
 				continue
@@ -686,6 +689,9 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 			}
 		}
 		if err := flushPending(); err != nil {
+			return err
+		}
+		if err := compactDirectBranch(output, node.Name, a.directKeepRecent()); err != nil {
 			return err
 		}
 		fmt.Printf("[%d/%d] direct-write 完成 %s\n", i+1, len(chain), node.Name)
@@ -836,6 +842,13 @@ func (a *App) evolutionMaxBatchBytes() int {
 		return a.Config.Evolution.MaxBatchBytes
 	}
 	return 240000
+}
+
+func (a *App) directKeepRecent() int {
+	if a.Config.Evolution.DirectKeepRecent > 0 {
+		return a.Config.Evolution.DirectKeepRecent
+	}
+	return 500
 }
 
 func (a *App) shouldSplitBatch(sizeBytes, itemCount int) bool {
@@ -1346,6 +1359,16 @@ func directCommitRecorded(dir string, commit model.Commit) (bool, error) {
 			return true, nil
 		}
 	}
+	data, err := os.ReadFile(commitEvolutionArchivePath(dir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if containsCommitHash(string(data), commit.Hash) {
+		return true, nil
+	}
 	return false, nil
 }
 
@@ -1393,6 +1416,11 @@ func DirectRecord(outputDir string, hashes []string, source string) error {
 	if strings.TrimSpace(text) == "" {
 		text = "# 提交演进\n\n"
 	}
+	archiveData, err := os.ReadFile(commitEvolutionArchivePath(outputDir))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	knownText := text + "\n" + string(archiveData)
 	if strings.TrimSpace(source) == "" {
 		source = "agent"
 	}
@@ -1413,7 +1441,7 @@ func DirectRecord(outputDir string, hashes []string, source string) error {
 		if len(shortHash) > 12 {
 			shortHash = shortHash[:12]
 		}
-		if strings.Contains(text, hash) || strings.Contains(text, shortHash) {
+		if strings.Contains(knownText, hash) || strings.Contains(knownText, shortHash) {
 			continue
 		}
 		fmt.Fprintf(&body, "## %s\n\n- 已处理，记录来源：%s。\n\n", hash, source)
@@ -1421,13 +1449,194 @@ func DirectRecord(outputDir string, hashes []string, source string) error {
 	return storage.AtomicWrite(path, []byte(body.String()))
 }
 
+func compactDirectBranch(output, branch string, keepRecent int) error {
+	dir := storage.BranchDocDir(output, branch)
+	if err := compactCommitEvolutionDoc(dir, branch, keepRecent); err != nil {
+		return err
+	}
+	return nil
+}
+
+type markdownSection struct {
+	Heading string
+	Body    string
+	Hash    string
+}
+
+func compactCommitEvolutionDoc(dir, branch string, keepRecent int) error {
+	if keepRecent <= 0 {
+		return nil
+	}
+	path := filepath.Join(dir, "commit-evolution.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	prefix, sections := splitCommitEvolutionSections(string(data))
+	if len(sections) <= keepRecent {
+		return nil
+	}
+	cut := len(sections) - keepRecent
+	archived := sections[:cut]
+	kept := sections[cut:]
+	if err := appendCommitEvolutionArchive(dir, branch, archived); err != nil {
+		return err
+	}
+	var body strings.Builder
+	body.WriteString(strings.TrimRight(stripCommitEvolutionArchiveNotice(prefix), "\n"))
+	body.WriteString("\n\n")
+	fmt.Fprintf(&body, "> 早期 %d 个 commit 小节已归档到 [archive/commit-evolution.md](./archive/commit-evolution.md)，本文件保留最近 %d 个 commit 以便续写。\n\n", cut, keepRecent)
+	for _, section := range kept {
+		body.WriteString(section.Body)
+		if !strings.HasSuffix(section.Body, "\n\n") {
+			if strings.HasSuffix(section.Body, "\n") {
+				body.WriteByte('\n')
+			} else {
+				body.WriteString("\n\n")
+			}
+		}
+	}
+	return storage.AtomicWrite(path, []byte(body.String()))
+}
+
+func stripCommitEvolutionArchiveNotice(prefix string) string {
+	var lines []string
+	for _, line := range strings.SplitAfter(prefix, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "> 早期 ") &&
+			strings.Contains(line, "archive/commit-evolution.md") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "")
+}
+
+func appendCommitEvolutionArchive(dir, branch string, sections []markdownSection) error {
+	if len(sections) == 0 {
+		return nil
+	}
+	path := commitEvolutionArchivePath(dir)
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	existing := string(data)
+	seen := map[string]bool{}
+	for _, section := range splitMarkdownSections(existing) {
+		if section.Hash != "" {
+			seen[section.Hash] = true
+		}
+	}
+	var body strings.Builder
+	if strings.TrimSpace(existing) == "" {
+		fmt.Fprintf(&body, "# %s：提交演进归档\n\n", branch)
+		body.WriteString("本文件保存从活跃 commit-evolution.md 截断出的早期 commit 小节，供续跑查重和人工追溯。\n\n")
+	} else {
+		body.WriteString(existing)
+		if !strings.HasSuffix(existing, "\n") {
+			body.WriteByte('\n')
+		}
+		if !strings.HasSuffix(body.String(), "\n\n") {
+			body.WriteByte('\n')
+		}
+	}
+	for _, section := range sections {
+		if section.Hash != "" && seen[section.Hash] {
+			continue
+		}
+		body.WriteString(section.Body)
+		if !strings.HasSuffix(section.Body, "\n\n") {
+			if strings.HasSuffix(section.Body, "\n") {
+				body.WriteByte('\n')
+			} else {
+				body.WriteString("\n\n")
+			}
+		}
+		if section.Hash != "" {
+			seen[section.Hash] = true
+		}
+	}
+	return storage.AtomicWrite(path, []byte(body.String()))
+}
+
+func splitCommitEvolutionSections(text string) (string, []markdownSection) {
+	lines := strings.SplitAfter(text, "\n")
+	start := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(line, "## ") && extractHashPrefix(line) != "" {
+			start = i
+			break
+		}
+	}
+	prefix := strings.Join(lines[:start], "")
+	return prefix, splitMarkdownSections(strings.Join(lines[start:], ""))
+}
+
+func splitMarkdownSections(text string) []markdownSection {
+	lines := strings.SplitAfter(text, "\n")
+	var sections []markdownSection
+	start := -1
+	heading := ""
+	hash := ""
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "## ") {
+			continue
+		}
+		if start >= 0 {
+			sections = append(sections, markdownSection{
+				Heading: heading,
+				Body:    strings.Join(lines[start:i], ""),
+				Hash:    hash,
+			})
+		}
+		start = i
+		heading = strings.TrimSpace(line)
+		hash = extractHashPrefix(line)
+	}
+	if start >= 0 {
+		sections = append(sections, markdownSection{
+			Heading: heading,
+			Body:    strings.Join(lines[start:], ""),
+			Hash:    hash,
+		})
+	}
+	return sections
+}
+
+func extractHashPrefix(line string) string {
+	for _, field := range strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), "##")) {
+		field = strings.Trim(field, "`：:，,()（）[]【】")
+		if len(field) >= 7 && len(field) <= 40 && isLowerHex(field) {
+			return field
+		}
+	}
+	return ""
+}
+
+func isLowerHex(value string) bool {
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func commitEvolutionArchivePath(dir string) string {
+	return filepath.Join(dir, "archive", "commit-evolution.md")
+}
+
 const directCheckpointFile = "docs-seed-checkpoint.json"
 
 type directCheckpoint struct {
-	Version   int                               `json:"version"`
-	UpdatedAt string                            `json:"updated_at"`
-	Chain     []string                          `json:"chain"`
-	Branches  map[string]directCheckpointBranch `json:"branches"`
+	Version           int                               `json:"version"`
+	UpdatedAt         string                            `json:"updated_at"`
+	Chain             []string                          `json:"chain"`
+	Branches          map[string]directCheckpointBranch `json:"branches"`
+	ArchivedProcessed map[string]map[string]bool        `json:"-"`
 }
 
 type directCheckpointBranch struct {
@@ -1452,15 +1661,26 @@ type directCheckpointCommit struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
+type directCheckpointArchiveEntry struct {
+	Branch string                 `json:"branch"`
+	Commit directCheckpointCommit `json:"commit"`
+}
+
 func loadDirectCheckpoint(output string) (directCheckpoint, error) {
 	path := filepath.Join(output, directCheckpointFile)
 	checkpoint := directCheckpoint{
-		Version:  1,
-		Branches: map[string]directCheckpointBranch{},
+		Version:           1,
+		Branches:          map[string]directCheckpointBranch{},
+		ArchivedProcessed: map[string]map[string]bool{},
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if archived, archiveErr := loadDirectCheckpointArchiveIndex(output); archiveErr == nil {
+				checkpoint.ArchivedProcessed = archived
+			} else {
+				return directCheckpoint{}, archiveErr
+			}
 			return checkpoint, nil
 		}
 		return directCheckpoint{}, err
@@ -1474,18 +1694,150 @@ func loadDirectCheckpoint(output string) (directCheckpoint, error) {
 	if checkpoint.Branches == nil {
 		checkpoint.Branches = map[string]directCheckpointBranch{}
 	}
+	archived, err := loadDirectCheckpointArchiveIndex(output)
+	if err != nil {
+		return directCheckpoint{}, err
+	}
+	checkpoint.ArchivedProcessed = archived
 	return checkpoint, nil
 }
 
-func saveDirectCheckpoint(output string, checkpoint directCheckpoint) error {
+func saveDirectCheckpoint(output string, checkpoint directCheckpoint, keepRecent int) error {
 	checkpoint.Version = 1
 	checkpoint.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := compactDirectCheckpoint(output, &checkpoint, keepRecent); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(checkpoint, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
 	return storage.AtomicWrite(filepath.Join(output, directCheckpointFile), data)
+}
+
+func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) error {
+	if keepRecent <= 0 {
+		return nil
+	}
+	for name, branch := range checkpoint.Branches {
+		if len(branch.Processed) <= keepRecent {
+			continue
+		}
+		commits := make([]directCheckpointCommit, 0, len(branch.Processed))
+		for _, commit := range branch.Processed {
+			commits = append(commits, commit)
+		}
+		sort.SliceStable(commits, func(i, j int) bool {
+			if commits[i].Index == commits[j].Index {
+				return commits[i].ProcessedAt < commits[j].ProcessedAt
+			}
+			return commits[i].Index < commits[j].Index
+		})
+		archiveCount := len(commits) - keepRecent
+		if err := appendDirectCheckpointArchive(output, name, commits[:archiveCount]); err != nil {
+			return err
+		}
+		kept := map[string]directCheckpointCommit{}
+		for _, commit := range commits[archiveCount:] {
+			kept[commit.Hash] = commit
+		}
+		branch.Processed = kept
+		checkpoint.Branches[name] = branch
+	}
+	return nil
+}
+
+func appendDirectCheckpointArchive(output, branch string, commits []directCheckpointCommit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+	path := directCheckpointArchivePath(output, branch)
+	existing := map[string]bool{}
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(data) > 0 {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var entry directCheckpointArchiveEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				return fmt.Errorf("解析 checkpoint 归档 %s: %w", path, err)
+			}
+			existing[entry.Commit.Hash] = true
+		}
+	}
+	var body strings.Builder
+	body.Write(data)
+	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
+		body.WriteByte('\n')
+	}
+	for _, commit := range commits {
+		if commit.Hash == "" || existing[commit.Hash] {
+			continue
+		}
+		entry := directCheckpointArchiveEntry{Branch: branch, Commit: commit}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		body.Write(line)
+		body.WriteByte('\n')
+		existing[commit.Hash] = true
+	}
+	return storage.AtomicWrite(path, []byte(body.String()))
+}
+
+func loadDirectCheckpointArchiveIndex(output string) (map[string]map[string]bool, error) {
+	result := map[string]map[string]bool{}
+	dir := directCheckpointArchiveDir(output)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return result, nil
+		}
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var archived directCheckpointArchiveEntry
+			if err := json.Unmarshal([]byte(line), &archived); err != nil {
+				return nil, fmt.Errorf("解析 checkpoint 归档 %s: %w", path, err)
+			}
+			if archived.Branch == "" || archived.Commit.Hash == "" {
+				continue
+			}
+			if result[archived.Branch] == nil {
+				result[archived.Branch] = map[string]bool{}
+			}
+			result[archived.Branch][archived.Commit.Hash] = true
+		}
+	}
+	return result, nil
+}
+
+func directCheckpointArchivePath(output, branch string) string {
+	return filepath.Join(directCheckpointArchiveDir(output), safeMaterialName(branch)+".jsonl")
+}
+
+func directCheckpointArchiveDir(output string) string {
+	return filepath.Join(output, "archive", "docs-seed-checkpoint")
 }
 
 func updateDirectCheckpointBranch(checkpoint *directCheckpoint, node model.BranchNode, mode, base string, chain []model.BranchNode) {
@@ -1521,11 +1873,15 @@ func markDirectCheckpointProcessed(checkpoint *directCheckpoint, node model.Bran
 
 func directCheckpointHas(checkpoint directCheckpoint, branch, hash string) bool {
 	item, ok := checkpoint.Branches[branch]
-	if !ok || item.Processed == nil {
+	if ok && item.Processed != nil {
+		if _, ok := item.Processed[hash]; ok {
+			return true
+		}
+	}
+	if checkpoint.ArchivedProcessed == nil || checkpoint.ArchivedProcessed[branch] == nil {
 		return false
 	}
-	_, ok = item.Processed[hash]
-	return ok
+	return checkpoint.ArchivedProcessed[branch][hash]
 }
 
 func trimForError(text string, max int) string {
