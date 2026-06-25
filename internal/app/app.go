@@ -560,9 +560,8 @@ func (a *App) SyncWorkspace(ctx context.Context, force bool, evolution bool, dir
 }
 
 type directCommitBatchItem struct {
-	Commit        model.Commit
-	Index         int
-	RecordedInDoc bool
+	Commit model.Commit
+	Index  int
 }
 
 func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode, limit int, batchSize int) error {
@@ -605,7 +604,7 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		done()
 		updateDirectCheckpointBranch(&checkpoint, node, mode, base, chain)
 		done = traceStep("  保存 direct-write 存档点")
-		if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
+		if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
 			done()
 			return err
 		}
@@ -623,7 +622,7 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, item.Commit, item.Index+1, len(commits), "agent")
 			}
 			done := traceStep("    保存 direct-write 存档点")
-			if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
+			if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
 				done()
 				return err
 			}
@@ -645,21 +644,18 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				fmt.Printf("%s - 跳过，无有效业务文件变化\n", prefix)
 				continue
 			}
+			recordedInCheckpoint := directCheckpointHas(checkpoint, node.Name, commit.Hash)
+			if recordedInCheckpoint {
+				if err := flushPending(); err != nil {
+					return err
+				}
+				fmt.Printf("%s - 跳过，存档点已记录\n", prefix)
+				continue
+			}
 			dir := storage.BranchDocDir(output, node.Name)
 			recordedInDoc, err := directCommitRecorded(dir, commit)
 			if err != nil {
 				return err
-			}
-			recordedInCheckpoint := directCheckpointHas(checkpoint, node.Name, commit.Hash)
-			if recordedInCheckpoint && recordedInDoc {
-				if err := flushPending(); err != nil {
-					return err
-				}
-				fmt.Printf("%s - 跳过，存档点已记录且最终文档已沉淀\n", prefix)
-				continue
-			}
-			if recordedInCheckpoint && !recordedInDoc {
-				fmt.Printf("%s - 存档点已记录但最终文档缺少该提交，重新处理\n", prefix)
 			}
 			if !recordedInCheckpoint && recordedInDoc {
 				if err := flushPending(); err != nil {
@@ -667,13 +663,13 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				}
 				fmt.Printf("%s - 最终文档已有记录，补写存档点\n", prefix)
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "existing-doc")
-				if err := saveDirectCheckpoint(output, checkpoint, a.directKeepRecent()); err != nil {
+				if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
 					return err
 				}
 				continue
 			}
 			fmt.Printf("%s - 加入 direct-write agent 批次，变更文件 %d 个\n", prefix, len(commit.Files))
-			pending = append(pending, directCommitBatchItem{Commit: commit, Index: j, RecordedInDoc: recordedInDoc})
+			pending = append(pending, directCommitBatchItem{Commit: commit, Index: j})
 			remaining := batchSize
 			if limit > 0 && limit-processed < remaining {
 				remaining = limit - processed
@@ -1332,14 +1328,7 @@ func validateDirectWriteBatchResult(dir string, items []directCommitBatchItem, b
 			return fmt.Errorf("Agent 未在结果文档中记录当前提交 hash %s；请检查提示词或 Agent 写文件权限", short(item.Commit.Hash))
 		}
 	}
-	needsChange := false
-	for _, item := range items {
-		if !item.RecordedInDoc {
-			needsChange = true
-			break
-		}
-	}
-	if needsChange && !changed {
+	if !changed {
 		return fmt.Errorf("Agent 没有修改任何结果文档；当前批次未沉淀到最终文档")
 	}
 	return nil
@@ -1702,10 +1691,10 @@ func loadDirectCheckpoint(output string) (directCheckpoint, error) {
 	return checkpoint, nil
 }
 
-func saveDirectCheckpoint(output string, checkpoint directCheckpoint, keepRecent int) error {
+func saveDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) error {
 	checkpoint.Version = 1
 	checkpoint.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := compactDirectCheckpoint(output, &checkpoint, keepRecent); err != nil {
+	if err := compactDirectCheckpoint(output, checkpoint, keepRecent); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(checkpoint, "", "  ")
@@ -1719,6 +1708,9 @@ func saveDirectCheckpoint(output string, checkpoint directCheckpoint, keepRecent
 func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) error {
 	if keepRecent <= 0 {
 		return nil
+	}
+	if checkpoint.ArchivedProcessed == nil {
+		checkpoint.ArchivedProcessed = map[string]map[string]bool{}
 	}
 	for name, branch := range checkpoint.Branches {
 		if len(branch.Processed) <= keepRecent {
@@ -1735,8 +1727,17 @@ func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRe
 			return commits[i].Index < commits[j].Index
 		})
 		archiveCount := len(commits) - keepRecent
-		if err := appendDirectCheckpointArchive(output, name, commits[:archiveCount]); err != nil {
+		archivedCommits := commits[:archiveCount]
+		if err := appendDirectCheckpointArchive(output, name, archivedCommits); err != nil {
 			return err
+		}
+		if checkpoint.ArchivedProcessed[name] == nil {
+			checkpoint.ArchivedProcessed[name] = map[string]bool{}
+		}
+		for _, commit := range archivedCommits {
+			if commit.Hash != "" {
+				checkpoint.ArchivedProcessed[name][commit.Hash] = true
+			}
 		}
 		kept := map[string]directCheckpointCommit{}
 		for _, commit := range commits[archiveCount:] {

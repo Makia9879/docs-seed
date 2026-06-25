@@ -603,7 +603,7 @@ func TestSaveDirectCheckpointArchivesOldProcessedCommits(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, saveDirectCheckpoint(output, checkpoint, 1))
+	require.NoError(t, saveDirectCheckpoint(output, &checkpoint, 1))
 
 	loaded, err := loadDirectCheckpoint(output)
 	require.NoError(t, err)
@@ -614,6 +614,32 @@ func TestSaveDirectCheckpointArchivesOldProcessedCommits(t *testing.T) {
 	archive := readFile(t, directCheckpointArchivePath(output, "main"))
 	require.Contains(t, archive, hashes[0])
 	require.Contains(t, archive, hashes[1])
+}
+
+func TestSaveDirectCheckpointUpdatesInMemoryArchiveIndex(t *testing.T) {
+	output := t.TempDir()
+	hashes := []string{
+		strings.Repeat("a", 40),
+		strings.Repeat("b", 40),
+	}
+	checkpoint := directCheckpoint{
+		Version: 1,
+		Branches: map[string]directCheckpointBranch{
+			"main": {
+				Branch:    "main",
+				Processed: map[string]directCheckpointCommit{},
+			},
+		},
+	}
+	for i, hash := range hashes {
+		checkpoint.Branches["main"].Processed[hash] = directCheckpointCommit{
+			Hash: hash, ShortHash: short(hash), Subject: fmt.Sprintf("commit %d", i+1), Index: i + 1, Total: len(hashes),
+		}
+	}
+
+	require.NoError(t, saveDirectCheckpoint(output, &checkpoint, 1))
+	require.True(t, directCheckpointHas(checkpoint, "main", hashes[0]))
+	require.True(t, directCheckpointHas(checkpoint, "main", hashes[1]))
 }
 
 func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
@@ -723,6 +749,39 @@ func TestGenerateChainDirectResumesFromCheckpointAndExistingDocs(t *testing.T) {
 
 	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
 	require.Equal(t, 1, generator.count)
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
+	require.Equal(t, 1, generator.count)
+}
+
+func TestGenerateChainDirectResumesFromCheckpointEvenWhenDocsMissHash(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	writeFile(t, root, "service/order.go", "package service\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "root business")
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
+	require.Equal(t, 1, generator.count)
+
+	output := filepath.Join(root, ".docs-seed", "docs", "branches", "main")
+	for _, name := range directRecordDocNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(output, name), []byte("# "+name+"\n\nhash removed\n"), 0o644))
+	}
+
 	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 0))
 	require.Equal(t, 1, generator.count)
 }
