@@ -517,6 +517,40 @@ func TestGenerateChainDirectSplitsOversizedCommitBatch(t *testing.T) {
 	require.Equal(t, []int{1, 1, 1, 1, 1}, generator.batches)
 }
 
+func TestValidateDirectWriteBatchAcceptsHashInAnyResultDoc(t *testing.T) {
+	dir := t.TempDir()
+	hash := strings.Repeat("a", 40)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("# readme\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "business-logic.md"), []byte("# business\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "data-flow.md"), []byte("# data\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "adr.md"), []byte("# adr\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "commit-evolution.md"), []byte("# commits\n"), 0o644))
+	before, err := snapshotDirectDocs(dir)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "business-logic.md"), []byte("handled "+hash[:11]+"\n"), 0o644))
+
+	err = validateDirectWriteBatchResult(dir, []directCommitBatchItem{{
+		Commit: model.Commit{Hash: hash},
+		Index:  0,
+	}}, before)
+	require.NoError(t, err)
+}
+
+func TestDirectRecordAppendsMissingHashes(t *testing.T) {
+	dir := t.TempDir()
+	first := strings.Repeat("a", 40)
+	second := strings.Repeat("b", 40)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "commit-evolution.md"), []byte("# commits\n\n## "+first+"\n\n"), 0o644))
+
+	require.NoError(t, DirectRecord(dir, []string{first, second}, "test"))
+	require.NoError(t, DirectRecord(dir, []string{second}, "test"))
+
+	text := readFile(t, filepath.Join(dir, "commit-evolution.md"))
+	require.Contains(t, text, first)
+	require.Contains(t, text, second)
+	require.Equal(t, 1, strings.Count(text, second))
+}
+
 func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
 	oldRetryDelay := retryDelay
 	retryDelay = time.Millisecond
@@ -556,7 +590,7 @@ func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
 
 	err = instance.GenerateChainDirect(ctx, chain, 0, 0)
 	require.ErrorContains(t, err, "已停止重试")
-	require.ErrorContains(t, err, "Agent 未在 commit-evolution.md 记录当前提交")
+	require.ErrorContains(t, err, "Agent 未在结果文档中记录当前提交 hash")
 }
 
 func TestGenerateChainDirectRetriesUntilContextCancellation(t *testing.T) {

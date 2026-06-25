@@ -119,9 +119,10 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 			"--print",
 			"--no-session-persistence",
 			"--disable-slash-commands",
-			"--permission-mode", "acceptEdits",
-			"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit",
-			"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit",
+			"--dangerously-skip-permissions",
+			"--permission-mode", "bypassPermissions",
+			"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
+			"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
 		}
 		for _, dir := range addDirs {
 			if strings.TrimSpace(dir) != "" {

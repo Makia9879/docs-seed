@@ -1165,6 +1165,8 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 - 如果材料文件很大，可以使用 agent team/subagents 按文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
 - 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须追加或更新一个当前 commit 小节，小节标题必须包含完整 hash %s 或短 hash %s；即使当前 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
+- 写完文档后必须通过 Bash 执行这个固化命令，确保当前 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
+  docs-seed direct-record --output %s --source agent-direct-write %s
 - 不要删除前面 commit 已经总结出的有效内容，除非当前 commit 明确废弃或替代它。
 - 保持文档简洁，合并重复结论。
 
@@ -1183,7 +1185,7 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 - commit-evolution.md：按提交顺序逐 commit 记录业务演进事实。
 
 现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
-`, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+`, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), dir, commit.Hash, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, items []directCommitBatchItem, total int) string {
@@ -1196,8 +1198,10 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 	}
 	first, last := items[0].Index+1, items[len(items)-1].Index+1
 	var hashes []string
+	var hashArgs []string
 	for _, item := range items {
 		hashes = append(hashes, fmt.Sprintf("- %s (%s) %s", item.Commit.Hash, short(item.Commit.Hash), item.Commit.Subject))
+		hashArgs = append(hashArgs, item.Commit.Hash)
 	}
 	return fmt.Sprintf(`你是 docs-seed 的滚动文档生成 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
 
@@ -1230,6 +1234,8 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 - 如果当前批次材料文件很大，可以使用 agent team/subagents 按 commit 或文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
 - 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须为当前批次每个 commit 追加或更新一个小节，小节标题必须包含对应完整 hash 或短 hash；即使某个 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
+- 写完文档后必须通过 Bash 执行这个固化命令，确保当前批次每个 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
+  docs-seed direct-record --output %s --source agent-direct-write %s
 - 不要删除前面 commit 已经总结出的有效内容，除非当前批次 commit 明确废弃或替代它。
 - 保持文档简洁，合并重复结论。
 
@@ -1248,7 +1254,7 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 - commit-evolution.md：按提交顺序逐 commit 记录业务演进事实。
 
 现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
-`, node.Name, first, last, total, strings.Join(hashes, "\n"), materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+`, node.Name, first, last, total, strings.Join(hashes, "\n"), materialPath, dir, dir, strings.Join(hashArgs, " "), modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func snapshotDirectDocs(dir string) (map[string]string, error) {
@@ -1284,7 +1290,7 @@ func validateDirectWriteResult(dir string, commit model.Commit, before map[strin
 		return err
 	}
 	if !recorded {
-		return fmt.Errorf("Agent 未在 commit-evolution.md 记录当前提交 %s；请检查提示词或 Agent 写文件权限", short(commit.Hash))
+		return fmt.Errorf("Agent 未在结果文档中记录当前提交 hash %s；请检查提示词或 Agent 写文件权限", short(commit.Hash))
 	}
 	if !changed && !beforeRecorded {
 		return fmt.Errorf("Agent 没有修改任何结果文档；当前提交 %s 未沉淀到最终文档", short(commit.Hash))
@@ -1310,7 +1316,7 @@ func validateDirectWriteBatchResult(dir string, items []directCommitBatchItem, b
 			return err
 		}
 		if !recorded {
-			return fmt.Errorf("Agent 未在 commit-evolution.md 记录当前提交 %s；请检查提示词或 Agent 写文件权限", short(item.Commit.Hash))
+			return fmt.Errorf("Agent 未在结果文档中记录当前提交 hash %s；请检查提示词或 Agent 写文件权限", short(item.Commit.Hash))
 		}
 	}
 	needsChange := false
@@ -1327,19 +1333,92 @@ func validateDirectWriteBatchResult(dir string, items []directCommitBatchItem, b
 }
 
 func directCommitRecorded(dir string, commit model.Commit) (bool, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "commit-evolution.md"))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+	for _, name := range directRecordDocNames() {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
 		}
-		return false, err
+		text := string(data)
+		if containsCommitHash(text, commit.Hash) {
+			return true, nil
+		}
 	}
-	text := string(data)
-	return strings.Contains(text, commit.Hash) || strings.Contains(text, short(commit.Hash)), nil
+	return false, nil
+}
+
+func containsCommitHash(text, hash string) bool {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return false
+	}
+	if strings.Contains(text, hash) {
+		return true
+	}
+	maxPrefix := len(hash)
+	if maxPrefix > 12 {
+		maxPrefix = 12
+	}
+	for n := maxPrefix; n >= 7; n-- {
+		if strings.Contains(text, hash[:n]) {
+			return true
+		}
+	}
+	return false
+}
+
+func directRecordDocNames() []string {
+	return []string{"business-logic.md", "data-flow.md", "adr.md", "commit-evolution.md"}
 }
 
 func directDocNames() []string {
 	return []string{"README.md", "business-logic.md", "data-flow.md", "adr.md", "commit-evolution.md"}
+}
+
+func DirectRecord(outputDir string, hashes []string, source string) error {
+	if len(hashes) == 0 {
+		return errors.New("至少需要一个 commit hash")
+	}
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(outputDir, "commit-evolution.md")
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	text := string(data)
+	if strings.TrimSpace(text) == "" {
+		text = "# 提交演进\n\n"
+	}
+	if strings.TrimSpace(source) == "" {
+		source = "agent"
+	}
+	var body strings.Builder
+	body.WriteString(text)
+	if !strings.HasSuffix(text, "\n") {
+		body.WriteString("\n")
+	}
+	if !strings.HasSuffix(body.String(), "\n\n") {
+		body.WriteString("\n")
+	}
+	for _, hash := range hashes {
+		hash = strings.TrimSpace(hash)
+		if hash == "" {
+			continue
+		}
+		shortHash := hash
+		if len(shortHash) > 12 {
+			shortHash = shortHash[:12]
+		}
+		if strings.Contains(text, hash) || strings.Contains(text, shortHash) {
+			continue
+		}
+		fmt.Fprintf(&body, "## %s\n\n- 已处理，记录来源：%s。\n\n", hash, source)
+	}
+	return storage.AtomicWrite(path, []byte(body.String()))
 }
 
 const directCheckpointFile = "docs-seed-checkpoint.json"

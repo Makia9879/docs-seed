@@ -25,7 +25,7 @@ func newRoot() *cobra.Command {
 		SilenceUsage: true,
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(initCommand(), branchesCommand(), learnCommand(), generateCommand(), syncCommand(), workspaceCommand(), previewCommand())
+	root.AddCommand(initCommand(), branchesCommand(), learnCommand(), generateCommand(), syncCommand(), workspaceCommand(), previewCommand(), directRecordCommand())
 	return root
 }
 
@@ -276,6 +276,29 @@ func previewCommand() *cobra.Command {
 	}
 	parent.AddCommand(branches, files)
 	return parent
+}
+
+func directRecordCommand() *cobra.Command {
+	var output string
+	var source string
+	cmd := &cobra.Command{
+		Use:   "direct-record [commit-hash...]",
+		Short: "direct-write 辅助：在当前文档目录固化已处理 commit hash",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if output == "" {
+				output = "."
+			}
+			if err := app.DirectRecord(output, args, source); err != nil {
+				return err
+			}
+			fmt.Printf("已记录 %d 个 commit hash 到 %s\n", len(args), filepath.Join(output, "commit-evolution.md"))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&output, "output", ".", "direct-write 文档目录，默认当前目录")
+	cmd.Flags().StringVar(&source, "source", "agent-direct-record", "记录来源说明")
+	return cmd
 }
 
 func openCurrent() (*app.App, error) {
