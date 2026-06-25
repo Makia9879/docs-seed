@@ -207,7 +207,7 @@ func syncCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&evolution, "evolution", false, "按提交顺序逐步学习业务演进")
 	cmd.Flags().BoolVar(&directWrite, "direct-write", false, "让 Agent 直接写 Markdown 文档，主进程不解析 JSON")
 	cmd.Flags().IntVar(&directLimit, "limit-commits", 0, "direct-write 调试用：最多处理多少个有效提交，0 表示不限制")
-	cmd.Flags().IntVar(&evolutionBatchSize, "batch-size", 0, "evolution 模式下每次 Agent 调用分析多少个有效提交，0 使用配置 evolution.batch_size")
+	cmd.Flags().IntVar(&evolutionBatchSize, "batch-size", 0, "evolution/direct-write 模式下每次 Agent 调用处理多少个有效提交，0 使用配置 evolution.batch_size")
 	return cmd
 }
 

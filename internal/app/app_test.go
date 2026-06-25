@@ -2,12 +2,15 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Makia9879/docs-seed/internal/config"
 	"github.com/Makia9879/docs-seed/internal/gitx"
@@ -35,7 +38,7 @@ func (fakeGenerator) Generate(_ context.Context, _ string, prompt string) (model
 
 func (fakeGenerator) GenerateCommits(_ context.Context, _ string, prompt string) ([]model.CommitFact, error) {
 	var result []model.CommitFact
-	for _, hash := range hashesFromPrompt(prompt) {
+	for _, hash := range hashesFromPromptOrMaterial(prompt) {
 		result = append(result, model.CommitFact{
 			Commit: model.Commit{Hash: hash},
 			Fact: model.Fact{
@@ -51,7 +54,7 @@ func (fakeGenerator) GenerateCommits(_ context.Context, _ string, prompt string)
 
 func (fakeGenerator) Write(_ context.Context, workDir, prompt string, _ ...string) (string, error) {
 	output := workDir
-	hashes := hashesFromPrompt(prompt)
+	hashes := hashesFromPromptOrMaterial(prompt)
 	if strings.Contains(prompt, "写入目录：") {
 		for _, line := range strings.Split(prompt, "\n") {
 			line = strings.TrimSpace(line)
@@ -91,8 +94,19 @@ func (noOpWriteGenerator) Write(_ context.Context, _ string, _ string, _ ...stri
 	return "I did not edit files.", nil
 }
 
+type countingNoRecordWriteGenerator struct {
+	fakeGenerator
+	calls atomic.Int32
+}
+
+func (g *countingNoRecordWriteGenerator) Write(_ context.Context, _ string, _ string, _ ...string) (string, error) {
+	g.calls.Add(1)
+	return "I did not edit files.", nil
+}
+
 type countingWriteGenerator struct {
-	count int
+	count   int
+	batches []int
 }
 
 func (g *countingWriteGenerator) Generate(ctx context.Context, workDir, prompt string) (model.Fact, error) {
@@ -105,6 +119,11 @@ func (g *countingWriteGenerator) GenerateCommits(ctx context.Context, workDir, p
 
 func (g *countingWriteGenerator) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {
 	g.count++
+	hashes := hashesFromPromptOrMaterial(prompt)
+	if len(hashes) == 0 && strings.Contains(prompt, "当前 commit：") {
+		hashes = append(hashes, hashFromCurrentCommitLine(prompt))
+	}
+	g.batches = append(g.batches, len(hashes))
 	return fakeGenerator{}.Write(ctx, workDir, prompt, addDirs...)
 }
 
@@ -114,9 +133,33 @@ type countingCommitGenerator struct {
 }
 
 func (g *countingCommitGenerator) GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error) {
-	hashes := hashesFromPrompt(prompt)
+	hashes := hashesFromPromptOrMaterial(prompt)
 	g.batches = append(g.batches, len(hashes))
 	return fakeGenerator{}.GenerateCommits(ctx, workDir, prompt)
+}
+
+type flakyCommitGenerator struct {
+	fakeGenerator
+	failures int
+	calls    int
+}
+
+func (g *flakyCommitGenerator) GenerateCommits(ctx context.Context, workDir, prompt string) ([]model.CommitFact, error) {
+	g.calls++
+	if g.calls <= g.failures {
+		return nil, fmt.Errorf("temporary agent failure %d", g.calls)
+	}
+	return fakeGenerator{}.GenerateCommits(ctx, workDir, prompt)
+}
+
+type alwaysFailWriteGenerator struct {
+	fakeGenerator
+	calls atomic.Int32
+}
+
+func (g *alwaysFailWriteGenerator) Write(_ context.Context, _ string, _ string, _ ...string) (string, error) {
+	g.calls.Add(1)
+	return "", errors.New("agent write failed")
 }
 
 func TestLearnAndGenerateCurrentChain(t *testing.T) {
@@ -212,7 +255,7 @@ func TestLearnEvolutionCachesCommitsAndGeneratesEvolutionDoc(t *testing.T) {
 	require.Contains(t, evolution, "提交业务规则")
 }
 
-func TestLearnEvolutionBatchesCommitAnalysis(t *testing.T) {
+func TestLearnEvolutionUsesConfiguredCommitBatchSize(t *testing.T) {
 	root := t.TempDir()
 	runGit(t, root, "init", "-b", "main")
 	runGit(t, root, "config", "user.email", "docs-seed@example.com")
@@ -239,6 +282,123 @@ func TestLearnEvolutionBatchesCommitAnalysis(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, changed)
 	require.Equal(t, []int{3, 2}, generator.batches)
+}
+
+func TestLearnEvolutionSplitsOversizedCommitBatch(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 5; i++ {
+		writeFile(t, root, "service/order.go", "package service\n"+strings.Repeat(fmt.Sprintf("// order rule %d\n", i), i*80))
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-m", fmt.Sprintf("order batch %d", i))
+	}
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	cfg.Evolution.MaxBatchBytes = 1
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingCommitGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	changed, err := instance.LearnChainEvolution(context.Background(), chain, false, 5)
+	require.NoError(t, err)
+	require.Equal(t, 1, changed)
+	require.Equal(t, []int{1, 1, 1, 1, 1}, generator.batches)
+}
+
+func TestLearnEvolutionRetriesAgentBatchInFreshGoroutines(t *testing.T) {
+	oldRetryDelay := retryDelay
+	retryDelay = time.Millisecond
+	t.Cleanup(func() { retryDelay = oldRetryDelay })
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	writeFile(t, root, "service/order.go", "package service\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "root business")
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &flakyCommitGenerator{failures: 1}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	changed, err := instance.LearnChainEvolution(context.Background(), chain, false, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, changed)
+	require.Equal(t, 2, generator.calls)
+}
+
+func TestCommitBatchPromptPointsToMaterialFile(t *testing.T) {
+	commits := []model.Commit{{
+		Hash:    strings.Repeat("a", 40),
+		Parent:  strings.Repeat("b", 40),
+		Subject: "add settlement workflow",
+		Files:   []string{"service/settlement.go"},
+		Diff:    "diff --git a/service/settlement.go b/service/settlement.go\n+secret inline diff should stay in material\n",
+	}}
+	materialPath := "/repo/.docs-seed-agent-material/main-0001-0001-commits.md"
+	prompt := buildCommitBatchPrompt(model.BranchNode{Name: "main"}, "full", "", materialPath, commits, []int{0}, 1)
+
+	require.Contains(t, prompt, materialPath)
+	require.Contains(t, prompt, "请先读取这个材料文件")
+	require.NotContains(t, prompt, "secret inline diff")
+	require.NotContains(t, prompt, "diff --git")
+}
+
+func TestCommitBatchMaterialContainsOnlyCurrentBatch(t *testing.T) {
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+	first := model.Commit{
+		Hash:    strings.Repeat("a", 40),
+		Parent:  strings.Repeat("0", 40),
+		Subject: "first batch commit",
+		Files:   []string{"service/first.go"},
+		Diff:    "+first batch detail\n",
+	}
+	second := model.Commit{
+		Hash:    strings.Repeat("b", 40),
+		Parent:  first.Hash,
+		Subject: "second batch commit",
+		Files:   []string{"service/second.go"},
+		Diff:    "+second batch detail\n",
+	}
+
+	material := buildCommitBatchMaterial(node, "full", "", []model.Commit{second}, []int{1}, 2)
+	prompt := buildCommitBatchPrompt(node, "full", "", "/repo/.docs-seed-agent-material/main-0002-0002-commits.md", []model.Commit{second}, []int{1}, 2)
+
+	require.Contains(t, material, second.Hash)
+	require.Contains(t, material, "second batch detail")
+	require.NotContains(t, material, "first batch detail")
+	require.NotContains(t, material, "first batch commit")
+	require.NotContains(t, material, "service/first.go")
+	require.Contains(t, prompt, second.Hash)
+	require.NotContains(t, prompt, first.Hash)
+}
+
+func TestBranchPromptPointsToMaterialFile(t *testing.T) {
+	materialPath := "/repo/.docs-seed-agent-material/main-branch.md"
+	prompt := buildPrompt(config.Default("sample"), model.BranchNode{Name: "main"}, "full", "", materialPath, true)
+
+	require.Contains(t, prompt, materialPath)
+	require.Contains(t, prompt, "请先读取这个材料文件")
+	require.NotContains(t, prompt, "commit log")
+	require.NotContains(t, prompt, "service/secret.go")
 }
 
 func TestWorkspaceSyncUsesRootEvolutionBatchSize(t *testing.T) {
@@ -302,7 +462,66 @@ func TestGenerateChainDirectWritesDocumentsWithoutParsingJSON(t *testing.T) {
 	require.Contains(t, checkpoint, "processed_commits")
 }
 
+func TestGenerateChainDirectUsesConfiguredCommitBatchSize(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 5; i++ {
+		writeFile(t, root, "service/order.go", strings.Repeat("package service\n", i))
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-m", fmt.Sprintf("direct batch %d", i))
+	}
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 3))
+	require.Equal(t, []int{3, 2}, generator.batches)
+}
+
+func TestGenerateChainDirectSplitsOversizedCommitBatch(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 5; i++ {
+		writeFile(t, root, "service/order.go", "package service\n"+strings.Repeat(fmt.Sprintf("// direct rule %d\n", i), i*80))
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-m", fmt.Sprintf("direct batch %d", i))
+	}
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	cfg.Evolution.MaxBatchBytes = 1
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 5))
+	require.Equal(t, []int{1, 1, 1, 1, 1}, generator.batches)
+}
+
 func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
+	oldRetryDelay := retryDelay
+	retryDelay = time.Millisecond
+	t.Cleanup(func() { retryDelay = oldRetryDelay })
+
 	root := t.TempDir()
 	runGit(t, root, "init", "-b", "main")
 	runGit(t, root, "config", "user.email", "docs-seed@example.com")
@@ -314,16 +533,72 @@ func TestGenerateChainDirectFailsWhenAgentDoesNotRecordCommit(t *testing.T) {
 	cfg := config.Default("sample")
 	cfg.Branches.MainPatterns = []string{"main"}
 	require.NoError(t, config.Save(root, cfg))
+	generator := &countingNoRecordWriteGenerator{}
 	instance := &App{
-		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: noOpWriteGenerator{},
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
 	}
 	graph, err := instance.SyncBranches(context.Background(), false)
 	require.NoError(t, err)
 	chain, err := instance.CurrentChain(context.Background(), graph, "main")
 	require.NoError(t, err)
 
-	err = instance.GenerateChainDirect(context.Background(), chain, 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			if generator.calls.Load() >= 2 {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	err = instance.GenerateChainDirect(ctx, chain, 0, 0)
+	require.ErrorContains(t, err, "已停止重试")
 	require.ErrorContains(t, err, "Agent 未在 commit-evolution.md 记录当前提交")
+}
+
+func TestGenerateChainDirectRetriesUntilContextCancellation(t *testing.T) {
+	oldRetryDelay := retryDelay
+	retryDelay = time.Millisecond
+	t.Cleanup(func() { retryDelay = oldRetryDelay })
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	writeFile(t, root, "service/order.go", "package service\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "root business")
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	require.NoError(t, config.Save(root, cfg))
+	generator := &alwaysFailWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			if generator.calls.Load() >= 2 {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	err = instance.GenerateChainDirect(ctx, chain, 0, 0)
+	require.ErrorContains(t, err, "已停止重试")
+	require.GreaterOrEqual(t, int(generator.calls.Load()), 2)
 }
 
 func TestGenerateChainDirectResumesFromCheckpointAndExistingDocs(t *testing.T) {
@@ -373,6 +648,26 @@ func readFile(t *testing.T, path string) string {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return string(data)
+}
+
+func hashesFromPromptOrMaterial(prompt string) []string {
+	if hashes := hashesFromPrompt(prompt); len(hashes) > 0 {
+		return hashes
+	}
+	for _, line := range strings.Split(prompt, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, ".docs-seed-agent-material") {
+			continue
+		}
+		data, err := os.ReadFile(line)
+		if err != nil {
+			continue
+		}
+		if hashes := hashesFromPrompt(string(data)); len(hashes) > 0 {
+			return hashes
+		}
+	}
+	return nil
 }
 
 func hashesFromPrompt(prompt string) []string {

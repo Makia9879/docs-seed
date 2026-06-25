@@ -42,8 +42,9 @@ type AgentConfig struct {
 }
 
 type EvolutionConfig struct {
-	BatchSize    int `yaml:"batch_size"`
-	DiffMaxBytes int `yaml:"diff_max_bytes"`
+	BatchSize     int `yaml:"batch_size"`
+	DiffMaxBytes  int `yaml:"diff_max_bytes"`
+	MaxBatchBytes int `yaml:"max_batch_bytes"`
 }
 
 type DocsConfig struct {
@@ -76,8 +77,9 @@ func Default(name string) Config {
 			Timeout: 1800,
 		},
 		Evolution: EvolutionConfig{
-			BatchSize:    8,
-			DiffMaxBytes: 120000,
+			BatchSize:     8,
+			DiffMaxBytes:  120000,
+			MaxBatchBytes: 240000,
 		},
 		Docs: DocsConfig{Output: ".docs-seed/docs"},
 		Exclude: []string{
@@ -116,6 +118,9 @@ func Load(root string) (Config, error) {
 	}
 	if cfg.Evolution.DiffMaxBytes <= 0 {
 		cfg.Evolution.DiffMaxBytes = 120000
+	}
+	if cfg.Evolution.MaxBatchBytes <= 0 {
+		cfg.Evolution.MaxBatchBytes = 240000
 	}
 	return cfg, nil
 }
