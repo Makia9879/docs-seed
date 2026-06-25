@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,12 +116,16 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	case "codex":
 		args = []string{"--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "-"}
 	default:
+		sessionID, err := newSessionID()
+		if err != nil {
+			return "", fmt.Errorf("生成 %s session id 失败: %w", r.Config.Engine, err)
+		}
 		args = []string{
 			"--print",
-			"--no-session-persistence",
 			"--disable-slash-commands",
 			"--dangerously-skip-permissions",
 			"--permission-mode", "bypassPermissions",
+			"--session-id", sessionID,
 			"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
 			"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
 		}
@@ -136,12 +141,32 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	start := time.Now()
-	fmt.Printf("      agent %s write start: dir=%s timeout=%s\n", r.Config.Engine, workDir, timeout)
+	sessionInfo := sessionInfoFromArgs(args)
+	fmt.Printf("      agent %s write start: dir=%s timeout=%s%s\n", r.Config.Engine, workDir, timeout, sessionInfo)
 	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("调用 %s 直写失败: %w: %s", r.Config.Engine, err, combinedOutput(stderr.String(), stdout.String()))
+		return stdout.String(), fmt.Errorf("调用 %s 直写失败%s: %w: %s", r.Config.Engine, sessionInfo, err, combinedOutput(stderr.String(), stdout.String()))
 	}
-	fmt.Printf("      agent %s write done: %s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond))
+	fmt.Printf("      agent %s write done: %s%s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond), sessionInfo)
 	return stdout.String(), nil
+}
+
+func newSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+func sessionInfoFromArgs(args []string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--session-id" && strings.TrimSpace(args[i+1]) != "" {
+			return " session_id=" + args[i+1]
+		}
+	}
+	return ""
 }
 
 func combinedOutput(stderrText, stdoutText string) string {
