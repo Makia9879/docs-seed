@@ -828,7 +828,7 @@ type retryResult[T any] struct {
 
 var retryDelay = 3 * time.Second
 
-const directArchiveExcerptMaxBytes = 64 * 1024
+const directArchiveExcerptMaxBytes = 12 * 1024
 
 func retryInFreshGoroutine[T any](ctx context.Context, label string, fn func(context.Context) (T, error)) (T, error) {
 	var zero T
@@ -1371,18 +1371,20 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 重要：归档材料不在本提示词中。请先读取这个材料文件：
 %s
 
-材料文件会内嵌归档文件的有界尾部片段。默认只根据这些片段和当前三份最终总结校准；不要一次性读取完整归档文件。只有片段明显不完整且无法判断某条业务事实时，才按路径精确读取必要的小范围内容。
+材料文件会内嵌归档文件的有界尾部片段。默认只根据这些片段和当前三份最终总结校准；不要一次性读取完整归档文件。读取材料文件、最终总结或归档文件时，必须使用小范围读取，每次 Read 的 limit 不超过 120 行；需要定位内容时优先使用 Grep。只有片段明显不完整且无法判断某条业务事实时，才按路径精确读取必要的小范围内容。编辑成功后不要回读整文件，除非工具明确返回失败或需要定位下一处精确替换点。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
 
-必须读取并按需更新这些最终总结文件：
+必须按需小范围读取并更新这些最终总结文件，禁止整文件回读：
 - business-logic.md
 - data-flow.md
 - adr.md
 
 归档汇总规则：
 - 只根据材料文件内嵌的归档片段和当前三份最终总结做校准；不要处理新 commit，不要重新分析未归档历史。
+- 禁止读取完整 archive/commit-evolution.md、checkpoint JSONL 或完整最终总结文档；如果需要查证，只能按标题、关键词或具体行号小范围读取。
+- 使用 Edit/Write 成功后，不要为了确认而回读完整文件；工具成功返回即视为写入完成。
 - 对 business-logic.md、data-flow.md、adr.md：把归档演进文档中已经沉淀的历史业务事实合并进最终总结，去重、合并同类项，并保留仍然有效的业务状态、数据流和架构决策。
 - 不要把归档小节复制回活跃 commit-evolution.md；commit-evolution.md 继续只保留最近小节和归档提示。
 - 如果某条归档事实已经被最终总结覆盖，可以保持原文不变；但不能因为小节已归档就删除最终总结中的历史业务事实。
@@ -1395,7 +1397,7 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 - 阅读链路：%s
 - 分析范围：%s
 
-现在开始：读取材料文件中的有界归档片段，然后只校准写入目录下的最终总结 Markdown 文件。
+现在开始：先用 Read limit<=120 读取材料文件开头；如需更多内容，按 offset 分页读取。然后只校准写入目录下的最终总结 Markdown 文件。
 `, materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 

@@ -455,12 +455,28 @@ func TestDirectArchiveSummaryMaterialIncludesBoundedArchiveExcerpts(t *testing.T
 	require.NoError(t, err)
 
 	require.Contains(t, material, "## commit_evolution_archive")
-	require.Contains(t, material, "excerpt: last 65536 bytes only")
+	require.Contains(t, material, fmt.Sprintf("excerpt: last %d bytes only", directArchiveExcerptMaxBytes))
 	require.Contains(t, material, "older archive content intentionally omitted")
 	require.Contains(t, material, "recent archive fact")
 	require.Contains(t, material, "## checkpoint_archive")
 	require.Contains(t, material, "recent checkpoint")
 	require.Less(t, len(material), len(archiveContent))
+	require.Less(t, len(material), 30*1024)
+}
+
+func TestDirectArchiveSummaryPromptRequiresSmallRangeReads(t *testing.T) {
+	output := t.TempDir()
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+
+	prompt := buildDirectArchiveSummaryPrompt(output, node, "full", "", []model.BranchNode{node}, "/tmp/main-archive-summary.md")
+
+	require.Contains(t, prompt, "每次 Read 的 limit 不超过 120 行")
+	require.Contains(t, prompt, "优先使用 Grep")
+	require.Contains(t, prompt, "禁止读取完整 archive/commit-evolution.md")
+	require.Contains(t, prompt, "禁止整文件回读")
+	require.Contains(t, prompt, "编辑成功后不要回读整文件")
+	require.Contains(t, prompt, "工具成功返回即视为写入完成")
+	require.Contains(t, prompt, "Read limit<=120")
 }
 
 func TestBranchPromptPointsToMaterialFile(t *testing.T) {
