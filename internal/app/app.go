@@ -604,11 +604,17 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		done()
 		updateDirectCheckpointBranch(&checkpoint, node, mode, base, chain)
 		done = traceStep("  保存 direct-write 存档点")
-		if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
+		archived, err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent())
+		if err != nil {
 			done()
 			return err
 		}
 		done()
+		if archived {
+			if err := a.writeDirectArchiveSummary(ctx, output, node, mode, base, chain); err != nil {
+				return err
+			}
+		}
 		var pending []directCommitBatchItem
 		flushPending := func() error {
 			if len(pending) == 0 {
@@ -622,13 +628,20 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, item.Commit, item.Index+1, len(commits), "agent")
 			}
 			done := traceStep("    保存 direct-write 存档点")
-			if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
+			checkpointArchived, err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent())
+			if err != nil {
 				done()
 				return err
 			}
 			done()
-			if err := compactDirectBranch(output, node.Name, a.directKeepRecent()); err != nil {
+			commitArchived, err := compactDirectBranch(output, node.Name, a.directKeepRecent())
+			if err != nil {
 				return err
+			}
+			if checkpointArchived || commitArchived {
+				if err := a.writeDirectArchiveSummary(ctx, output, node, mode, base, chain); err != nil {
+					return err
+				}
 			}
 			processed += count
 			pending = nil
@@ -663,8 +676,14 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 				}
 				fmt.Printf("%s - 最终文档已有记录，补写存档点\n", prefix)
 				markDirectCheckpointProcessed(&checkpoint, node, mode, base, chain, commit, j+1, len(commits), "existing-doc")
-				if err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent()); err != nil {
+				archived, err := saveDirectCheckpoint(output, &checkpoint, a.directKeepRecent())
+				if err != nil {
 					return err
+				}
+				if archived {
+					if err := a.writeDirectArchiveSummary(ctx, output, node, mode, base, chain); err != nil {
+						return err
+					}
 				}
 				continue
 			}
@@ -687,8 +706,14 @@ func (a *App) GenerateChainDirect(ctx context.Context, chain []model.BranchNode,
 		if err := flushPending(); err != nil {
 			return err
 		}
-		if err := compactDirectBranch(output, node.Name, a.directKeepRecent()); err != nil {
+		archived, err = compactDirectBranch(output, node.Name, a.directKeepRecent())
+		if err != nil {
 			return err
+		}
+		if archived {
+			if err := a.writeDirectArchiveSummary(ctx, output, node, mode, base, chain); err != nil {
+				return err
+			}
 		}
 		fmt.Printf("[%d/%d] direct-write 完成 %s\n", i+1, len(chain), node.Name)
 	}
@@ -764,6 +789,28 @@ func (a *App) writeDirectCommitBatch(ctx context.Context, output string, node mo
 		fmt.Printf("    %s - 完成，已沉淀到 %s\n", short(item.Commit.Hash), dir)
 	}
 	return len(items), nil
+}
+
+func (a *App) writeDirectArchiveSummary(ctx context.Context, output string, node model.BranchNode, mode, base string, chain []model.BranchNode) error {
+	dir := storage.BranchDocDir(output, node.Name)
+	done := traceStep("    写入 direct-write 归档汇总材料")
+	material, err := writeDirectArchiveSummaryMaterial(a.Root, output, node, mode, base, chain)
+	if err != nil {
+		done()
+		return err
+	}
+	done()
+	prompt := buildDirectArchiveSummaryPrompt(output, node, mode, base, chain, material)
+	done = traceStep("    Agent 汇总已归档材料")
+	_, err = retryInFreshGoroutine(ctx, "Agent direct-write 归档汇总 "+node.Name, func(attemptCtx context.Context) (string, error) {
+		return a.Generator.Write(attemptCtx, dir, prompt, a.Root)
+	})
+	if err != nil {
+		done()
+		return fmt.Errorf("direct-write 分支 %s 归档汇总: %w", node.Name, err)
+	}
+	done()
+	return nil
 }
 
 func traceStep(label string) func() {
@@ -1086,6 +1133,7 @@ func writeDirectWriteCommitMaterial(root, output string, node model.BranchNode, 
 	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
 		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
 	fmt.Fprintf(&body, "commit_index: %d\ncommit_total: %d\n\n", index, total)
+	body.WriteString(buildDirectArchiveMaterial(output, node))
 	fmt.Fprintf(&body, "hash: %s\nparent: %s\ntime: %s\nsubject: %s\n", commit.Hash, commit.Parent, commit.Timestamp, commit.Subject)
 	if commit.Body != "" {
 		fmt.Fprintf(&body, "body:\n%s\n", commit.Body)
@@ -1112,6 +1160,24 @@ func writeDirectWriteCommitBatchMaterial(root, output string, node model.BranchN
 	return path, nil
 }
 
+func writeDirectArchiveSummaryMaterial(root, output string, node model.BranchNode, mode, base string, chain []model.BranchNode) (string, error) {
+	dir := filepath.Join(storage.StateDir(root), "tmp", "direct-write")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-archive-summary.md", strings.ReplaceAll(node.Name, "/", "__")))
+	var body strings.Builder
+	fmt.Fprintf(&body, "# docs-seed direct-write archive summary material: %s\n\n", node.Name)
+	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
+	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
+		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
+	body.WriteString(buildDirectArchiveMaterial(output, node))
+	if err := storage.AtomicWrite(path, []byte(body.String())); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func estimateDirectWriteCommitBatchMaterialBytes(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, items []directCommitBatchItem, total int) int {
 	return len(buildDirectWriteCommitBatchMaterial(output, node, mode, base, chain, items, total))
 }
@@ -1123,6 +1189,7 @@ func buildDirectWriteCommitBatchMaterial(output string, node model.BranchNode, m
 	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
 	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
 		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
+	body.WriteString(buildDirectArchiveMaterial(output, node))
 	for _, item := range items {
 		commit := item.Commit
 		fmt.Fprintf(&body, "--- COMMIT %d/%d ---\n", item.Index+1, total)
@@ -1134,6 +1201,29 @@ func buildDirectWriteCommitBatchMaterial(output string, node model.BranchNode, m
 		fmt.Fprintf(&body, "diff:\n%s\n\n", commit.Diff)
 	}
 	return body.String()
+}
+
+func buildDirectArchiveMaterial(output string, node model.BranchNode) string {
+	dir := storage.BranchDocDir(output, node.Name)
+	archives := []struct {
+		label string
+		path  string
+	}{
+		{label: "commit_evolution_archive", path: commitEvolutionArchivePath(dir)},
+		{label: "checkpoint_archive", path: directCheckpointArchivePath(output, node.Name)},
+	}
+	var existing []string
+	for _, archive := range archives {
+		if _, err := os.Stat(archive.path); err == nil {
+			existing = append(existing, fmt.Sprintf("- %s: %s", archive.label, archive.path))
+		}
+	}
+	if len(existing) == 0 {
+		return "## Archived material\n\narchived_material: none\n\n"
+	}
+	return "## Archived material\n\n" +
+		"These files are part of the already-processed history. Read them before updating final summaries so archived commit sections and checkpoint records remain represented in business-logic.md, data-flow.md, and adr.md without copying the archive back into active commit-evolution.md.\n\n" +
+		strings.Join(existing, "\n") + "\n\n"
 }
 
 func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, commit model.Commit, index, total int) string {
@@ -1152,6 +1242,8 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 
 重要：本次 commit 的详细材料不在本提示词中。请先读取这个材料文件：
 %s
+
+如果材料文件列出 archived material 路径，必须同时读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，更新最终总结时不能丢失它们承载的业务演进信息。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
@@ -1172,7 +1264,7 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 滚动更新规则：
 - 本次只根据材料文件中的当前 commit 更新文档。
 - 如果材料文件很大，可以使用 agent team/subagents 按文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
-- 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；没有业务影响则不要强行新增。
+- 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；同时保留材料文件列出的归档演进文档中已经沉淀的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须追加或更新一个当前 commit 小节，小节标题必须包含完整 hash %s 或短 hash %s；即使当前 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
   docs-seed direct-record --output %s --source agent-direct-write %s
@@ -1195,6 +1287,49 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 
 现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
 `, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), dir, commit.Hash, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+}
+
+func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string) string {
+	dir := storage.BranchDocDir(output, node.Name)
+	modeLabel := "全量基线"
+	scope := "从该分支可达历史的第一个提交开始，汇总已处理业务演进"
+	if mode == "incremental" {
+		modeLabel = "相对父主分支的增量"
+		scope = fmt.Sprintf("只汇总相对父主分支 %s、从 %s 到 %s 的已处理增量业务演进", node.Parent, short(base), short(node.Tip))
+	}
+	return fmt.Sprintf(`你是 docs-seed 的归档汇总校准 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
+
+任务：本分支刚触发 direct-write 归档。请读取归档材料，确认被归档的 commit-evolution 小节和 checkpoint 记录承载的业务演进已经总结进最终文档。
+
+重要：归档材料不在本提示词中。请先读取这个材料文件：
+%s
+
+材料文件会列出 archived material 路径。必须读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，不能只用于查重，也不能只留在归档文件里。
+
+写入目录：%s
+当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
+
+必须读取并按需更新这些最终总结文件：
+- business-logic.md
+- data-flow.md
+- adr.md
+
+归档汇总规则：
+- 只根据材料文件列出的归档材料和当前三份最终总结做校准；不要处理新 commit，不要重新分析未归档历史。
+- 对 business-logic.md、data-flow.md、adr.md：把归档演进文档中已经沉淀的历史业务事实合并进最终总结，去重、合并同类项，并保留仍然有效的业务状态、数据流和架构决策。
+- 不要把归档小节复制回活跃 commit-evolution.md；commit-evolution.md 继续只保留最近小节和归档提示。
+- 如果某条归档事实已经被最终总结覆盖，可以保持原文不变；但不能因为小节已归档就删除最终总结中的历史业务事实。
+- 不写函数签名、类名清单、API 调用示例、CLI 命令、参数说明、安装步骤、代码调用方式、测试方法或代码块。
+
+分支信息：
+- 文档类型：%s
+- 父主分支：%s
+- 提交范围：%s
+- 阅读链路：%s
+- 分析范围：%s
+
+现在开始：读取材料文件和归档文件，然后只校准写入目录下的最终总结 Markdown 文件。
+`, materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, items []directCommitBatchItem, total int) string {
@@ -1222,6 +1357,8 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 重要：当前批次的详细材料不在本提示词中。请先读取这个材料文件：
 %s
 
+如果材料文件列出 archived material 路径，必须同时读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，更新最终总结时不能丢失它们承载的业务演进信息。
+
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
 
@@ -1241,7 +1378,7 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 滚动更新规则：
 - 必须严格按材料文件处理当前 session commit 批次。
 - 如果当前批次材料文件很大，可以使用 agent team/subagents 按 commit 或文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
-- 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；没有业务影响则不要强行新增。
+- 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；同时保留材料文件列出的归档演进文档中已经沉淀的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须为当前批次每个 commit 追加或更新一个小节，小节标题必须包含对应完整 hash 或短 hash；即使某个 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前批次每个 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
   docs-seed direct-record --output %s --source agent-direct-write %s
@@ -1438,12 +1575,13 @@ func DirectRecord(outputDir string, hashes []string, source string) error {
 	return storage.AtomicWrite(path, []byte(body.String()))
 }
 
-func compactDirectBranch(output, branch string, keepRecent int) error {
+func compactDirectBranch(output, branch string, keepRecent int) (bool, error) {
 	dir := storage.BranchDocDir(output, branch)
-	if err := compactCommitEvolutionDoc(dir, branch, keepRecent); err != nil {
-		return err
+	archived, err := compactCommitEvolutionDoc(dir, branch, keepRecent)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	return archived, nil
 }
 
 type markdownSection struct {
@@ -1452,27 +1590,27 @@ type markdownSection struct {
 	Hash    string
 }
 
-func compactCommitEvolutionDoc(dir, branch string, keepRecent int) error {
+func compactCommitEvolutionDoc(dir, branch string, keepRecent int) (bool, error) {
 	if keepRecent <= 0 {
-		return nil
+		return false, nil
 	}
 	path := filepath.Join(dir, "commit-evolution.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	prefix, sections := splitCommitEvolutionSections(string(data))
 	if len(sections) <= keepRecent {
-		return nil
+		return false, nil
 	}
 	cut := len(sections) - keepRecent
 	archived := sections[:cut]
 	kept := sections[cut:]
 	if err := appendCommitEvolutionArchive(dir, branch, archived); err != nil {
-		return err
+		return false, err
 	}
 	var body strings.Builder
 	body.WriteString(strings.TrimRight(stripCommitEvolutionArchiveNotice(prefix), "\n"))
@@ -1488,7 +1626,7 @@ func compactCommitEvolutionDoc(dir, branch string, keepRecent int) error {
 			}
 		}
 	}
-	return storage.AtomicWrite(path, []byte(body.String()))
+	return true, storage.AtomicWrite(path, []byte(body.String()))
 }
 
 func stripCommitEvolutionArchiveNotice(prefix string) string {
@@ -1691,27 +1829,29 @@ func loadDirectCheckpoint(output string) (directCheckpoint, error) {
 	return checkpoint, nil
 }
 
-func saveDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) error {
+func saveDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) (bool, error) {
 	checkpoint.Version = 1
 	checkpoint.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := compactDirectCheckpoint(output, checkpoint, keepRecent); err != nil {
-		return err
+	archived, err := compactDirectCheckpoint(output, checkpoint, keepRecent)
+	if err != nil {
+		return false, err
 	}
 	data, err := json.MarshalIndent(checkpoint, "", "  ")
 	if err != nil {
-		return err
+		return false, err
 	}
 	data = append(data, '\n')
-	return storage.AtomicWrite(filepath.Join(output, directCheckpointFile), data)
+	return archived, storage.AtomicWrite(filepath.Join(output, directCheckpointFile), data)
 }
 
-func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) error {
+func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRecent int) (bool, error) {
 	if keepRecent <= 0 {
-		return nil
+		return false, nil
 	}
 	if checkpoint.ArchivedProcessed == nil {
 		checkpoint.ArchivedProcessed = map[string]map[string]bool{}
 	}
+	archivedAny := false
 	for name, branch := range checkpoint.Branches {
 		if len(branch.Processed) <= keepRecent {
 			continue
@@ -1729,8 +1869,9 @@ func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRe
 		archiveCount := len(commits) - keepRecent
 		archivedCommits := commits[:archiveCount]
 		if err := appendDirectCheckpointArchive(output, name, archivedCommits); err != nil {
-			return err
+			return false, err
 		}
+		archivedAny = true
 		if checkpoint.ArchivedProcessed[name] == nil {
 			checkpoint.ArchivedProcessed[name] = map[string]bool{}
 		}
@@ -1746,7 +1887,7 @@ func compactDirectCheckpoint(output string, checkpoint *directCheckpoint, keepRe
 		branch.Processed = kept
 		checkpoint.Branches[name] = branch
 	}
-	return nil
+	return archivedAny, nil
 }
 
 func appendDirectCheckpointArchive(output, branch string, commits []directCheckpointCommit) error {

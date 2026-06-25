@@ -308,8 +308,13 @@ direct-write 的恢复存档保存在最终文档根目录：
 <docs.output>/archive/docs-seed-checkpoint/<branch>.jsonl
 ```
 
-归档文件仍参与续跑查重：Docs Seed 读取存档点时会加载 JSONL 归档索引，校验结果文档时也会查询
-`archive/commit-evolution.md`，因此截断不会丢失历史记录，也不会让已处理 commit 被重复投递给 Agent。
+归档文件不只参与续跑查重。每次 direct-write 触发 `commit-evolution.md` 或
+`docs-seed-checkpoint.json` 截断归档后，Docs Seed 会立即启动一次归档汇总校准，让
+Agent 读取 `archive/commit-evolution.md` 和 checkpoint JSONL 归档，并校准
+`business-logic.md`、`data-flow.md`、`adr.md`，确保被归档的小节承载的历史业务事实已经
+沉淀到最终总结中，而不是只留在归档文件里。读取存档点时仍会加载 JSONL 归档索引，
+校验结果文档时也会查询 `archive/commit-evolution.md`，因此截断不会丢失历史记录，也
+不会让已处理 commit 被重复投递给 Agent。
 
 每次运行都会重新计算当前阅读链路和各分支段的提交集合，并优先按存档点判断是否跳过。
 只要 `docs-seed-checkpoint.json` 或归档 JSONL 已记录该 commit，Docs Seed 就会跳过该提交，

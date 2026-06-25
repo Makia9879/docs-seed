@@ -15,6 +15,7 @@ import (
 	"github.com/Makia9879/docs-seed/internal/config"
 	"github.com/Makia9879/docs-seed/internal/gitx"
 	"github.com/Makia9879/docs-seed/internal/model"
+	"github.com/Makia9879/docs-seed/internal/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -105,8 +106,10 @@ func (g *countingNoRecordWriteGenerator) Write(_ context.Context, _ string, _ st
 }
 
 type countingWriteGenerator struct {
-	count   int
-	batches []int
+	count              int
+	archiveSummaries   int
+	archiveSummaryText string
+	batches            []int
 }
 
 func (g *countingWriteGenerator) Generate(ctx context.Context, workDir, prompt string) (model.Fact, error) {
@@ -119,12 +122,26 @@ func (g *countingWriteGenerator) GenerateCommits(ctx context.Context, workDir, p
 
 func (g *countingWriteGenerator) Write(ctx context.Context, workDir, prompt string, addDirs ...string) (string, error) {
 	g.count++
+	if strings.Contains(prompt, "归档汇总校准 Agent") {
+		g.archiveSummaries++
+		g.archiveSummaryText = prompt
+		requireArchiveSummaryDocs(workDir)
+		return "archive summary updated", nil
+	}
 	hashes := hashesFromPromptOrMaterial(prompt)
 	if len(hashes) == 0 && strings.Contains(prompt, "当前 commit：") {
 		hashes = append(hashes, hashFromCurrentCommitLine(prompt))
 	}
 	g.batches = append(g.batches, len(hashes))
 	return fakeGenerator{}.Write(ctx, workDir, prompt, addDirs...)
+}
+
+func requireArchiveSummaryDocs(workDir string) {
+	for _, name := range []string{"business-logic.md", "data-flow.md", "adr.md"} {
+		path := filepath.Join(workDir, name)
+		data, _ := os.ReadFile(path)
+		_ = os.WriteFile(path, append(data, []byte("\n归档历史已纳入最终总结。\n")...), 0o644)
+	}
 }
 
 type countingCommitGenerator struct {
@@ -391,6 +408,37 @@ func TestCommitBatchMaterialContainsOnlyCurrentBatch(t *testing.T) {
 	require.NotContains(t, prompt, first.Hash)
 }
 
+func TestDirectWriteBatchMaterialIncludesArchivePaths(t *testing.T) {
+	output := t.TempDir()
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+	dir := storage.BranchDocDir(output, node.Name)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "archive"), 0o755))
+	require.NoError(t, os.MkdirAll(directCheckpointArchiveDir(output), 0o755))
+	require.NoError(t, os.WriteFile(commitEvolutionArchivePath(dir), []byte("# archive\n\n## "+strings.Repeat("a", 40)+"\n\n- archived fact\n"), 0o644))
+	require.NoError(t, os.WriteFile(directCheckpointArchivePath(output, node.Name), []byte(`{"branch":"main","commit":{"hash":"`+strings.Repeat("b", 40)+`"}}`+"\n"), 0o644))
+	item := directCommitBatchItem{
+		Commit: model.Commit{
+			Hash:    strings.Repeat("c", 40),
+			Parent:  strings.Repeat("b", 40),
+			Subject: "current change",
+			Files:   []string{"service/current.go"},
+			Diff:    "+current\n",
+		},
+		Index: 2,
+	}
+
+	material := buildDirectWriteCommitBatchMaterial(output, node, "full", "", []model.BranchNode{node}, []directCommitBatchItem{item}, 3)
+	prompt := buildDirectWriteCommitBatchPrompt(output, node, "full", "", []model.BranchNode{node}, "/tmp/material.md", []directCommitBatchItem{item}, 3)
+
+	require.Contains(t, material, "## Archived material")
+	require.Contains(t, material, "commit_evolution_archive: "+commitEvolutionArchivePath(dir))
+	require.Contains(t, material, "checkpoint_archive: "+directCheckpointArchivePath(output, node.Name))
+	require.Contains(t, material, item.Commit.Hash)
+	require.Contains(t, prompt, "archived material")
+	require.Contains(t, prompt, "归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史")
+	require.Contains(t, prompt, "保留材料文件列出的归档演进文档")
+}
+
 func TestBranchPromptPointsToMaterialFile(t *testing.T) {
 	materialPath := "/repo/.docs-seed-agent-material/main-branch.md"
 	prompt := buildPrompt(config.Default("sample"), model.BranchNode{Name: "main"}, "full", "", materialPath, true)
@@ -489,6 +537,45 @@ func TestGenerateChainDirectUsesConfiguredCommitBatchSize(t *testing.T) {
 	require.Equal(t, []int{3, 2}, generator.batches)
 }
 
+func TestGenerateChainDirectSummarizesArchivesWhenCompactionHappensAtEnd(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "docs-seed@example.com")
+	runGit(t, root, "config", "user.name", "Docs Seed")
+	for i := 1; i <= 3; i++ {
+		writeFile(t, root, "service/order.go", strings.Repeat("package service\n", i))
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-m", fmt.Sprintf("direct archive %d", i))
+	}
+
+	cfg := config.Default("sample")
+	cfg.Branches.MainPatterns = []string{"main"}
+	cfg.Evolution.DirectKeepRecent = 1
+	require.NoError(t, config.Save(root, cfg))
+	generator := &countingWriteGenerator{}
+	instance := &App{
+		Root: root, Config: cfg, Repo: gitx.Repository{Root: root}, Generator: generator,
+	}
+	graph, err := instance.SyncBranches(context.Background(), false)
+	require.NoError(t, err)
+	chain, err := instance.CurrentChain(context.Background(), graph, "main")
+	require.NoError(t, err)
+
+	require.NoError(t, instance.GenerateChainDirect(context.Background(), chain, 0, 3))
+
+	output := filepath.Join(root, ".docs-seed", "docs")
+	dir := filepath.Join(output, "branches", "main")
+	require.Equal(t, []int{3}, generator.batches)
+	require.GreaterOrEqual(t, generator.archiveSummaries, 1)
+	require.Contains(t, generator.archiveSummaryText, "归档汇总校准 Agent")
+	require.Contains(t, generator.archiveSummaryText, "不能只用于查重")
+	require.FileExists(t, filepath.Join(dir, "archive", "commit-evolution.md"))
+	require.FileExists(t, directCheckpointArchivePath(output, "main"))
+	require.Contains(t, readFile(t, filepath.Join(dir, "business-logic.md")), "归档历史已纳入最终总结")
+	require.Contains(t, readFile(t, filepath.Join(dir, "data-flow.md")), "归档历史已纳入最终总结")
+	require.Contains(t, readFile(t, filepath.Join(dir, "adr.md")), "归档历史已纳入最终总结")
+}
+
 func TestGenerateChainDirectSplitsOversizedCommitBatch(t *testing.T) {
 	root := t.TempDir()
 	runGit(t, root, "init", "-b", "main")
@@ -565,7 +652,9 @@ func TestCompactCommitEvolutionArchivesOldSectionsAndPreservesLookup(t *testing.
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "commit-evolution.md"), []byte(body.String()), 0o644))
 
-	require.NoError(t, compactCommitEvolutionDoc(dir, "main", 1))
+	archived, err := compactCommitEvolutionDoc(dir, "main", 1)
+	require.NoError(t, err)
+	require.True(t, archived)
 
 	active := readFile(t, filepath.Join(dir, "commit-evolution.md"))
 	archive := readFile(t, filepath.Join(dir, "archive", "commit-evolution.md"))
@@ -603,7 +692,9 @@ func TestSaveDirectCheckpointArchivesOldProcessedCommits(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, saveDirectCheckpoint(output, &checkpoint, 1))
+	archived, err := saveDirectCheckpoint(output, &checkpoint, 1)
+	require.NoError(t, err)
+	require.True(t, archived)
 
 	loaded, err := loadDirectCheckpoint(output)
 	require.NoError(t, err)
@@ -637,7 +728,9 @@ func TestSaveDirectCheckpointUpdatesInMemoryArchiveIndex(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, saveDirectCheckpoint(output, &checkpoint, 1))
+	archived, err := saveDirectCheckpoint(output, &checkpoint, 1)
+	require.NoError(t, err)
+	require.True(t, archived)
 	require.True(t, directCheckpointHas(checkpoint, "main", hashes[0]))
 	require.True(t, directCheckpointHas(checkpoint, "main", hashes[1]))
 }
