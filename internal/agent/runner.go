@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -116,24 +116,7 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	case "codex":
 		args = []string{"--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "-"}
 	default:
-		sessionID, err := newSessionID()
-		if err != nil {
-			return "", fmt.Errorf("生成 %s session id 失败: %w", r.Config.Engine, err)
-		}
-		args = []string{
-			"--print",
-			"--disable-slash-commands",
-			"--dangerously-skip-permissions",
-			"--permission-mode", "bypassPermissions",
-			"--session-id", sessionID,
-			"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
-			"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
-		}
-		for _, dir := range addDirs {
-			if strings.TrimSpace(dir) != "" {
-				args = append(args, "--add-dir", dir)
-			}
-		}
+		args = claudeWriteArgs(addDirs...)
 	}
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = workDir
@@ -141,30 +124,94 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	start := time.Now()
-	sessionInfo := sessionInfoFromArgs(args)
-	fmt.Printf("      agent %s write start: dir=%s timeout=%s%s\n", r.Config.Engine, workDir, timeout, sessionInfo)
+	fmt.Printf("      agent %s write start: dir=%s timeout=%s\n", r.Config.Engine, workDir, timeout)
 	if err := cmd.Run(); err != nil {
+		sessionInfo := sessionInfoFromOutput(stdout.String(), stderr.String())
 		return stdout.String(), fmt.Errorf("调用 %s 直写失败%s: %w: %s", r.Config.Engine, sessionInfo, err, combinedOutput(stderr.String(), stdout.String()))
 	}
+	sessionInfo := sessionInfoFromOutput(stdout.String(), stderr.String())
 	fmt.Printf("      agent %s write done: %s%s\n", r.Config.Engine, time.Since(start).Round(time.Millisecond), sessionInfo)
 	return stdout.String(), nil
 }
 
-func newSessionID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+func claudeWriteArgs(addDirs ...string) []string {
+	args := []string{
+		"--print",
+		"--disable-slash-commands",
+		"--dangerously-skip-permissions",
+		"--permission-mode", "bypassPermissions",
+		"--allowedTools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
+		"--tools", "Read,Glob,Grep,LS,Write,Edit,MultiEdit,Bash",
 	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+	for _, dir := range addDirs {
+		if strings.TrimSpace(dir) != "" {
+			args = append(args, "--add-dir", dir)
+		}
+	}
+	return args
 }
 
-func sessionInfoFromArgs(args []string) string {
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--session-id" && strings.TrimSpace(args[i+1]) != "" {
-			return " session_id=" + args[i+1]
+func sessionInfoFromOutput(outputs ...string) string {
+	for _, output := range outputs {
+		if id := sessionIDFromJSON(output); id != "" {
+			return " session_id=" + id
 		}
+	}
+	for _, output := range outputs {
+		if id := sessionIDFromText(output); id != "" {
+			return " session_id=" + id
+		}
+	}
+	return ""
+}
+
+func sessionIDFromJSON(output string) string {
+	for _, text := range append([]string{output}, strings.Split(output, "\n")...) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		var value any
+		if json.Unmarshal([]byte(text), &value) == nil {
+			if id := findSessionID(value); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func findSessionID(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			normalized := strings.ReplaceAll(strings.ToLower(key), "_", "")
+			normalized = strings.ReplaceAll(normalized, "-", "")
+			if normalized == "sessionid" {
+				if id, ok := child.(string); ok && strings.TrimSpace(id) != "" {
+					return strings.TrimSpace(id)
+				}
+			}
+			if id := findSessionID(child); id != "" {
+				return id
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if id := findSessionID(child); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+var sessionIDPattern = regexp.MustCompile(`(?i)session[_ -]?id["':=\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`)
+
+func sessionIDFromText(output string) string {
+	matches := sessionIDPattern.FindStringSubmatch(output)
+	if len(matches) == 2 {
+		return matches[1]
 	}
 	return ""
 }

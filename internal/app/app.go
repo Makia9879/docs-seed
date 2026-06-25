@@ -828,6 +828,8 @@ type retryResult[T any] struct {
 
 var retryDelay = 3 * time.Second
 
+const directArchiveExcerptMaxBytes = 64 * 1024
+
 func retryInFreshGoroutine[T any](ctx context.Context, label string, fn func(context.Context) (T, error)) (T, error) {
 	var zero T
 	var lastErr error
@@ -1166,16 +1168,29 @@ func writeDirectArchiveSummaryMaterial(root, output string, node model.BranchNod
 		return "", err
 	}
 	path := filepath.Join(dir, fmt.Sprintf("%s-archive-summary.md", strings.ReplaceAll(node.Name, "/", "__")))
+	body, err := buildDirectArchiveSummaryMaterial(output, node, mode, base, chain)
+	if err != nil {
+		return "", err
+	}
+	if err := storage.AtomicWrite(path, []byte(body)); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func buildDirectArchiveSummaryMaterial(output string, node model.BranchNode, mode, base string, chain []model.BranchNode) (string, error) {
 	var body strings.Builder
 	fmt.Fprintf(&body, "# docs-seed direct-write archive summary material: %s\n\n", node.Name)
 	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
 	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
 		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
-	body.WriteString(buildDirectArchiveMaterial(output, node))
-	if err := storage.AtomicWrite(path, []byte(body.String())); err != nil {
+	if err := appendDirectArchiveSummaryExcerpt(&body, "commit_evolution_archive", commitEvolutionArchivePath(storage.BranchDocDir(output, node.Name)), directArchiveExcerptMaxBytes); err != nil {
 		return "", err
 	}
-	return path, nil
+	if err := appendDirectArchiveSummaryExcerpt(&body, "checkpoint_archive", directCheckpointArchivePath(output, node.Name), directArchiveExcerptMaxBytes); err != nil {
+		return "", err
+	}
+	return body.String(), nil
 }
 
 func estimateDirectWriteCommitBatchMaterialBytes(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, items []directCommitBatchItem, total int) int {
@@ -1222,8 +1237,60 @@ func buildDirectArchiveMaterial(output string, node model.BranchNode) string {
 		return "## Archived material\n\narchived_material: none\n\n"
 	}
 	return "## Archived material\n\n" +
-		"These files are part of the already-processed history. Read them before updating final summaries so archived commit sections and checkpoint records remain represented in business-logic.md, data-flow.md, and adr.md without copying the archive back into active commit-evolution.md.\n\n" +
+		"These files are part of the already-processed history. Use them as lookup and trace indexes when needed, but do not bulk-read the full archives during normal commit batch handling. Archive summary calibration uses a separate bounded material file.\n\n" +
 		strings.Join(existing, "\n") + "\n\n"
+}
+
+func appendDirectArchiveSummaryExcerpt(body *strings.Builder, label, path string, maxBytes int64) error {
+	fmt.Fprintf(body, "## %s\n\npath: %s\n", label, path)
+	data, truncated, err := readFileTail(path, maxBytes)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			body.WriteString("status: missing\n\n")
+			return nil
+		}
+		return err
+	}
+	fmt.Fprintf(body, "bytes: %d\n", len(data))
+	if truncated {
+		fmt.Fprintf(body, "excerpt: last %d bytes only; older archive content intentionally omitted to keep the agent prompt bounded.\n", maxBytes)
+	} else {
+		body.WriteString("excerpt: full file\n")
+	}
+	body.WriteString("content:\n```text\n")
+	body.WriteString(strings.ToValidUTF8(string(data), ""))
+	if !strings.HasSuffix(string(data), "\n") {
+		body.WriteByte('\n')
+	}
+	body.WriteString("```\n\n")
+	return nil
+}
+
+func readFileTail(path string, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		maxBytes = directArchiveExcerptMaxBytes
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	if info.Size() <= maxBytes {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, false, err
+		}
+		return data, false, nil
+	}
+	data := make([]byte, int(maxBytes))
+	if _, err := file.ReadAt(data, info.Size()-maxBytes); err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
 }
 
 func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, commit model.Commit, index, total int) string {
@@ -1243,7 +1310,7 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 重要：本次 commit 的详细材料不在本提示词中。请先读取这个材料文件：
 %s
 
-如果材料文件列出 archived material 路径，必须同时读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，更新最终总结时不能丢失它们承载的业务演进信息。
+如果材料文件列出 archived material 路径，它们只是已处理历史的查重/追溯索引。普通 commit 处理不要批量读取完整归档文件；归档汇总校准会使用单独的有界材料文件。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
@@ -1264,7 +1331,7 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 滚动更新规则：
 - 本次只根据材料文件中的当前 commit 更新文档。
 - 如果材料文件很大，可以使用 agent team/subagents 按文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
-- 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；同时保留材料文件列出的归档演进文档中已经沉淀的历史业务事实；没有业务影响则不要强行新增。
+- 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；同时保留已有最终总结中的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须追加或更新一个当前 commit 小节，小节标题必须包含完整 hash %s 或短 hash %s；即使当前 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
   docs-seed direct-record --output %s --source agent-direct-write %s
@@ -1304,7 +1371,7 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 重要：归档材料不在本提示词中。请先读取这个材料文件：
 %s
 
-材料文件会列出 archived material 路径。必须读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，不能只用于查重，也不能只留在归档文件里。
+材料文件会内嵌归档文件的有界尾部片段。默认只根据这些片段和当前三份最终总结校准；不要一次性读取完整归档文件。只有片段明显不完整且无法判断某条业务事实时，才按路径精确读取必要的小范围内容。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
@@ -1315,7 +1382,7 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 - adr.md
 
 归档汇总规则：
-- 只根据材料文件列出的归档材料和当前三份最终总结做校准；不要处理新 commit，不要重新分析未归档历史。
+- 只根据材料文件内嵌的归档片段和当前三份最终总结做校准；不要处理新 commit，不要重新分析未归档历史。
 - 对 business-logic.md、data-flow.md、adr.md：把归档演进文档中已经沉淀的历史业务事实合并进最终总结，去重、合并同类项，并保留仍然有效的业务状态、数据流和架构决策。
 - 不要把归档小节复制回活跃 commit-evolution.md；commit-evolution.md 继续只保留最近小节和归档提示。
 - 如果某条归档事实已经被最终总结覆盖，可以保持原文不变；但不能因为小节已归档就删除最终总结中的历史业务事实。
@@ -1328,7 +1395,7 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 - 阅读链路：%s
 - 分析范围：%s
 
-现在开始：读取材料文件和归档文件，然后只校准写入目录下的最终总结 Markdown 文件。
+现在开始：读取材料文件中的有界归档片段，然后只校准写入目录下的最终总结 Markdown 文件。
 `, materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
@@ -1357,7 +1424,7 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 重要：当前批次的详细材料不在本提示词中。请先读取这个材料文件：
 %s
 
-如果材料文件列出 archived material 路径，必须同时读取这些归档文件；归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史，更新最终总结时不能丢失它们承载的业务演进信息。
+如果材料文件列出 archived material 路径，它们只是已处理历史的查重/追溯索引。普通 commit 处理不要批量读取完整归档文件；归档汇总校准会使用单独的有界材料文件。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
@@ -1378,7 +1445,7 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 滚动更新规则：
 - 必须严格按材料文件处理当前 session commit 批次。
 - 如果当前批次材料文件很大，可以使用 agent team/subagents 按 commit 或文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
-- 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；同时保留材料文件列出的归档演进文档中已经沉淀的历史业务事实；没有业务影响则不要强行新增。
+- 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；同时保留已有最终总结中的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须为当前批次每个 commit 追加或更新一个小节，小节标题必须包含对应完整 hash 或短 hash；即使某个 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前批次每个 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
   docs-seed direct-record --output %s --source agent-direct-write %s

@@ -435,8 +435,32 @@ func TestDirectWriteBatchMaterialIncludesArchivePaths(t *testing.T) {
 	require.Contains(t, material, "checkpoint_archive: "+directCheckpointArchivePath(output, node.Name))
 	require.Contains(t, material, item.Commit.Hash)
 	require.Contains(t, prompt, "archived material")
-	require.Contains(t, prompt, "归档的 commit-evolution 小节和 checkpoint 记录属于已处理历史")
-	require.Contains(t, prompt, "保留材料文件列出的归档演进文档")
+	require.Contains(t, prompt, "查重/追溯索引")
+	require.Contains(t, prompt, "不要批量读取完整归档文件")
+	require.Contains(t, prompt, "保留已有最终总结中的历史业务事实")
+}
+
+func TestDirectArchiveSummaryMaterialIncludesBoundedArchiveExcerpts(t *testing.T) {
+	output := t.TempDir()
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+	dir := storage.BranchDocDir(output, node.Name)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "archive"), 0o755))
+	require.NoError(t, os.MkdirAll(directCheckpointArchiveDir(output), 0o755))
+	archivePath := commitEvolutionArchivePath(dir)
+	archiveContent := strings.Repeat("older archive fact\n", 5000) + "recent archive fact\n"
+	require.NoError(t, os.WriteFile(archivePath, []byte(archiveContent), 0o644))
+	require.NoError(t, os.WriteFile(directCheckpointArchivePath(output, node.Name), []byte("recent checkpoint\n"), 0o644))
+
+	material, err := buildDirectArchiveSummaryMaterial(output, node, "full", "", []model.BranchNode{node})
+	require.NoError(t, err)
+
+	require.Contains(t, material, "## commit_evolution_archive")
+	require.Contains(t, material, "excerpt: last 65536 bytes only")
+	require.Contains(t, material, "older archive content intentionally omitted")
+	require.Contains(t, material, "recent archive fact")
+	require.Contains(t, material, "## checkpoint_archive")
+	require.Contains(t, material, "recent checkpoint")
+	require.Less(t, len(material), len(archiveContent))
 }
 
 func TestBranchPromptPointsToMaterialFile(t *testing.T) {
@@ -568,7 +592,8 @@ func TestGenerateChainDirectSummarizesArchivesWhenCompactionHappensAtEnd(t *test
 	require.Equal(t, []int{3}, generator.batches)
 	require.GreaterOrEqual(t, generator.archiveSummaries, 1)
 	require.Contains(t, generator.archiveSummaryText, "归档汇总校准 Agent")
-	require.Contains(t, generator.archiveSummaryText, "不能只用于查重")
+	require.Contains(t, generator.archiveSummaryText, "有界尾部片段")
+	require.Contains(t, generator.archiveSummaryText, "不要一次性读取完整归档文件")
 	require.FileExists(t, filepath.Join(dir, "archive", "commit-evolution.md"))
 	require.FileExists(t, directCheckpointArchivePath(output, "main"))
 	require.Contains(t, readFile(t, filepath.Join(dir, "business-logic.md")), "归档历史已纳入最终总结")
