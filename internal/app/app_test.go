@@ -445,6 +445,10 @@ func TestDirectWriteBatchMaterialIncludesArchivePaths(t *testing.T) {
 	require.Contains(t, prompt, "不要从第 1 行开始整文件翻页到结尾")
 	require.Contains(t, prompt, "工具成功返回即视为写入完成")
 	require.Contains(t, prompt, "保留已有最终总结中的历史业务事实")
+	require.Contains(t, prompt, "docs-seed_action: direct-write-commit-batch")
+	require.Contains(t, prompt, "docs-seed_phase: commit-batch")
+	require.Contains(t, prompt, "docs-seed_batch: 3-3/3")
+	require.NotContains(t, prompt, "agent session")
 }
 
 func TestDirectWriteSingleCommitPromptPreventsUnboundedReads(t *testing.T) {
@@ -464,6 +468,9 @@ func TestDirectWriteSingleCommitPromptPreventsUnboundedReads(t *testing.T) {
 	require.Contains(t, prompt, "不要一次性读取完整 commit-evolution.md")
 	require.Contains(t, prompt, "工具成功返回即视为写入完成")
 	require.Contains(t, prompt, "Grep 检查 commit-evolution.md")
+	require.Contains(t, prompt, "docs-seed_action: direct-write-single-commit")
+	require.Contains(t, prompt, "docs-seed_phase: commit")
+	require.Contains(t, prompt, "docs-seed_batch: 3/10")
 }
 
 func TestWriteDirectWriteCommitBatchMaterialWritesSmallIndexAndBoundedCommitFiles(t *testing.T) {
@@ -544,6 +551,9 @@ func TestDirectArchiveSummaryPromptRequiresSmallRangeReads(t *testing.T) {
 	require.Contains(t, prompt, "编辑成功后不要回读整文件")
 	require.Contains(t, prompt, "工具成功返回即视为写入完成")
 	require.Contains(t, prompt, "Read limit<=120")
+	require.Contains(t, prompt, "docs-seed_action: direct-write-archive-summary")
+	require.Contains(t, prompt, "docs-seed_phase: archive-summary")
+	require.Contains(t, prompt, "docs-seed_branch: main")
 }
 
 func TestBranchPromptPointsToMaterialFile(t *testing.T) {

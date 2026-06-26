@@ -1378,6 +1378,10 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 	}
 	return fmt.Sprintf(`你是 docs-seed 的滚动文档生成 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
 
+docs-seed_action: direct-write-single-commit
+docs-seed_phase: commit
+docs-seed_batch: %d/%d
+
 任务：处理主分支 %q 的第 %d/%d 个 commit，并基于已有文档滚动更新结果。
 
 当前 commit：%s %s
@@ -1435,7 +1439,7 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 - commit-evolution.md：按提交顺序逐 commit 记录业务演进事实。
 
 现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
-`, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), dir, commit.Hash, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+`, index, total, node.Name, index, total, short(commit.Hash), commit.Subject, materialPath, dir, commit.Hash, short(commit.Hash), dir, commit.Hash, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string) string {
@@ -1447,6 +1451,10 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 		scope = fmt.Sprintf("只汇总相对父主分支 %s、从 %s 到 %s 的已处理增量业务演进", node.Parent, short(base), short(node.Tip))
 	}
 	return fmt.Sprintf(`你是 docs-seed 的归档汇总校准 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
+
+docs-seed_action: direct-write-archive-summary
+docs-seed_phase: archive-summary
+docs-seed_branch: %s
 
 任务：本分支刚触发 direct-write 归档。请读取归档材料，确认被归档的 commit-evolution 小节和 checkpoint 记录承载的业务演进已经总结进最终文档。
 
@@ -1480,7 +1488,7 @@ func buildDirectArchiveSummaryPrompt(output string, node model.BranchNode, mode,
 - 分析范围：%s
 
 现在开始：先用 Read limit<=120 读取材料文件开头；如需更多内容，按 offset 分页读取。然后只校准写入目录下的最终总结 Markdown 文件。
-`, materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+`, node.Name, materialPath, dir, modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, materialPath string, items []directCommitBatchItem, total int) string {
@@ -1500,9 +1508,13 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 	}
 	return fmt.Sprintf(`你是 docs-seed 的滚动文档生成 Agent。请直接在当前工作目录更新 Markdown 文件，不要向 stdout 输出 JSON。
 
-任务：处理本次 agent session 中主分支 %q 的第 %d-%d/%d 个 commit，并基于已有文档滚动更新结果。本 session 只处理当前 --batch-size 批次，不要回头处理此前批次。
+docs-seed_action: direct-write-commit-batch
+docs-seed_phase: commit-batch
+docs-seed_batch: %d-%d/%d
 
-当前 session commit 批次：
+任务：处理本次 docs-seed action 中主分支 %q 的第 %d-%d/%d 个 commit，并基于已有文档滚动更新结果。本 action 只处理当前 --batch-size 批次，不要回头处理此前批次。
+
+当前 action commit 批次：
 %s
 
 重要：当前批次的详细材料不在本提示词中。请先读取这个材料文件：
@@ -1561,7 +1573,7 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 - commit-evolution.md：按提交顺序逐 commit 记录业务演进事实。
 
 现在开始：读取材料文件，然后只更新写入目录下的 Markdown 文件。
-`, node.Name, first, last, total, strings.Join(hashes, "\n"), materialPath, dir, dir, strings.Join(hashArgs, " "), modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
+`, first, last, total, node.Name, first, last, total, strings.Join(hashes, "\n"), materialPath, dir, dir, strings.Join(hashArgs, " "), modeLabel, emptyAs(node.Parent, "无"), commitRange(emptyBranchFact(node, mode, base)), chainNames(chain), scope)
 }
 
 func snapshotDirectDocs(dir string) (map[string]string, error) {

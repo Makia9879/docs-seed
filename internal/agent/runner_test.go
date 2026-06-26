@@ -9,6 +9,9 @@ func TestClaudeWriteArgsDoNotBindSyntheticSessionID(t *testing.T) {
 	if containsArg(args, "--session-id") {
 		t.Fatalf("claude write args must not bind a synthetic session id: %#v", args)
 	}
+	if !containsArg(args, "--no-session-persistence") {
+		t.Fatalf("claude write args must disable session persistence per action: %#v", args)
+	}
 	if !containsArgPair(args, "--add-dir", "/repo") {
 		t.Fatalf("claude write args should keep add-dir support: %#v", args)
 	}

@@ -137,6 +137,7 @@ func (r Runner) Write(ctx context.Context, workDir, prompt string, addDirs ...st
 func claudeWriteArgs(addDirs ...string) []string {
 	args := []string{
 		"--print",
+		"--no-session-persistence",
 		"--disable-slash-commands",
 		"--dangerously-skip-permissions",
 		"--permission-mode", "bypassPermissions",
