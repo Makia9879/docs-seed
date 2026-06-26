@@ -437,7 +437,74 @@ func TestDirectWriteBatchMaterialIncludesArchivePaths(t *testing.T) {
 	require.Contains(t, prompt, "archived material")
 	require.Contains(t, prompt, "查重/追溯索引")
 	require.Contains(t, prompt, "不要批量读取完整归档文件")
+	require.Contains(t, prompt, "每次 Read 必须带 limit")
+	require.Contains(t, prompt, "limit 不超过 120 行")
+	require.Contains(t, prompt, "material_path")
+	require.Contains(t, prompt, "每次只处理一个 material_path")
+	require.Contains(t, prompt, "禁止一次性读取所有 commit material")
+	require.Contains(t, prompt, "不要从第 1 行开始整文件翻页到结尾")
+	require.Contains(t, prompt, "工具成功返回即视为写入完成")
 	require.Contains(t, prompt, "保留已有最终总结中的历史业务事实")
+}
+
+func TestDirectWriteSingleCommitPromptPreventsUnboundedReads(t *testing.T) {
+	output := t.TempDir()
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+	commit := model.Commit{
+		Hash:    strings.Repeat("c", 40),
+		Parent:  strings.Repeat("b", 40),
+		Subject: "current change",
+	}
+
+	prompt := buildDirectWriteCommitPrompt(output, node, "full", "", []model.BranchNode{node}, "/tmp/material.md", commit, 3, 10)
+
+	require.Contains(t, prompt, "工具使用硬约束")
+	require.Contains(t, prompt, "每次 Read 必须带 limit")
+	require.Contains(t, prompt, "limit 不超过 120 行")
+	require.Contains(t, prompt, "不要一次性读取完整 commit-evolution.md")
+	require.Contains(t, prompt, "工具成功返回即视为写入完成")
+	require.Contains(t, prompt, "Grep 检查 commit-evolution.md")
+}
+
+func TestWriteDirectWriteCommitBatchMaterialWritesSmallIndexAndBoundedCommitFiles(t *testing.T) {
+	root := t.TempDir()
+	output := t.TempDir()
+	node := model.BranchNode{Name: "main", Tip: strings.Repeat("f", 40)}
+	hugeDiff := "diff --git a/service/current.go b/service/current.go\n" + strings.Repeat("+very large business diff\n", 5000)
+	item := directCommitBatchItem{
+		Commit: model.Commit{
+			Hash:    strings.Repeat("c", 40),
+			Parent:  strings.Repeat("b", 40),
+			Subject: "current change",
+			Files:   []string{"service/current.go"},
+			Diff:    hugeDiff,
+		},
+		Index: 2,
+	}
+
+	indexPath, err := writeDirectWriteCommitBatchMaterial(root, output, node, "full", "", []model.BranchNode{node}, []directCommitBatchItem{item}, 3)
+	require.NoError(t, err)
+	index := readFile(t, indexPath)
+
+	require.Contains(t, index, "# docs-seed direct-write commit batch index")
+	require.Contains(t, index, "material_path:")
+	require.NotContains(t, index, "+very large business diff")
+
+	var commitMaterialPath string
+	for _, line := range strings.Split(index, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "material_path: ") {
+			commitMaterialPath = strings.TrimSpace(strings.TrimPrefix(line, "material_path: "))
+			break
+		}
+	}
+	require.NotEmpty(t, commitMaterialPath)
+	commitMaterial := readFile(t, commitMaterialPath)
+	require.Contains(t, commitMaterial, item.Commit.Hash)
+	require.Contains(t, commitMaterial, "diff_status: truncated_to_")
+	require.Contains(t, commitMaterial, "[docs-seed: diff truncated")
+	require.Less(t, len(commitMaterial), len(hugeDiff))
+	require.Less(t, len(commitMaterial), directCommitDiffExcerptMaxBytes+4096)
 }
 
 func TestDirectArchiveSummaryMaterialIncludesBoundedArchiveExcerpts(t *testing.T) {
@@ -948,9 +1015,10 @@ func hashesFromPromptOrMaterial(prompt string) []string {
 	}
 	for _, line := range strings.Split(prompt, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.Contains(line, ".docs-seed-agent-material") {
+		if !strings.Contains(line, ".docs-seed-agent-material") && !strings.Contains(line, ".docs-seed") {
 			continue
 		}
+		line = strings.TrimPrefix(line, "material_path: ")
 		data, err := os.ReadFile(line)
 		if err != nil {
 			continue

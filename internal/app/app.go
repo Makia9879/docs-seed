@@ -829,6 +829,7 @@ type retryResult[T any] struct {
 var retryDelay = 3 * time.Second
 
 const directArchiveExcerptMaxBytes = 12 * 1024
+const directCommitDiffExcerptMaxBytes = 48 * 1024
 
 func retryInFreshGoroutine[T any](ctx context.Context, label string, fn func(context.Context) (T, error)) (T, error) {
 	var zero T
@@ -1155,11 +1156,30 @@ func writeDirectWriteCommitBatchMaterial(root, output string, node model.BranchN
 	}
 	first, last := items[0].Index+1, items[len(items)-1].Index+1
 	path := filepath.Join(dir, fmt.Sprintf("%s-%04d-%04d-batch.md", strings.ReplaceAll(node.Name, "/", "__"), first, last))
-	body := buildDirectWriteCommitBatchMaterial(output, node, mode, base, chain, items, total)
+	refs := make([]directCommitMaterialRef, 0, len(items))
+	for _, item := range items {
+		commitPath := filepath.Join(dir, fmt.Sprintf("%s-%04d-%s-commit.md", strings.ReplaceAll(node.Name, "/", "__"), item.Index+1, short(item.Commit.Hash)))
+		commitBody := buildDirectWriteCommitMaterialBody(output, node, mode, base, chain, item.Commit, item.Index+1, total)
+		if err := storage.AtomicWrite(commitPath, []byte(commitBody)); err != nil {
+			return "", err
+		}
+		refs = append(refs, directCommitMaterialRef{
+			Item:  item,
+			Path:  commitPath,
+			Bytes: len(commitBody),
+		})
+	}
+	body := buildDirectWriteCommitBatchIndexMaterial(output, node, mode, base, chain, refs, total)
 	if err := storage.AtomicWrite(path, []byte(body)); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+type directCommitMaterialRef struct {
+	Item  directCommitBatchItem
+	Path  string
+	Bytes int
 }
 
 func writeDirectArchiveSummaryMaterial(root, output string, node model.BranchNode, mode, base string, chain []model.BranchNode) (string, error) {
@@ -1216,6 +1236,61 @@ func buildDirectWriteCommitBatchMaterial(output string, node model.BranchNode, m
 		fmt.Fprintf(&body, "diff:\n%s\n\n", commit.Diff)
 	}
 	return body.String()
+}
+
+func buildDirectWriteCommitBatchIndexMaterial(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, refs []directCommitMaterialRef, total int) string {
+	first, last := refs[0].Item.Index+1, refs[len(refs)-1].Item.Index+1
+	var body strings.Builder
+	fmt.Fprintf(&body, "# docs-seed direct-write commit batch index: %s %d-%d/%d\n\n", node.Name, first, last, total)
+	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
+	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
+		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
+	body.WriteString(buildDirectArchiveMaterial(output, node))
+	body.WriteString("## Commit material files\n\n")
+	body.WriteString("Read this index first, then read each commit material file separately with small-range reads. Do not read all commit material files in one tool call.\n\n")
+	for _, ref := range refs {
+		commit := ref.Item.Commit
+		fmt.Fprintf(&body, "- commit_index: %d/%d\n", ref.Item.Index+1, total)
+		fmt.Fprintf(&body, "  hash: %s\n", commit.Hash)
+		fmt.Fprintf(&body, "  short_hash: %s\n", short(commit.Hash))
+		fmt.Fprintf(&body, "  subject: %s\n", commit.Subject)
+		fmt.Fprintf(&body, "  material_path: %s\n", ref.Path)
+		fmt.Fprintf(&body, "  material_bytes: %d\n", ref.Bytes)
+	}
+	return body.String()
+}
+
+func buildDirectWriteCommitMaterialBody(output string, node model.BranchNode, mode, base string, chain []model.BranchNode, commit model.Commit, index, total int) string {
+	var body strings.Builder
+	fmt.Fprintf(&body, "# docs-seed direct-write commit material: %s %d/%d\n\n", node.Name, index, total)
+	fmt.Fprintf(&body, "output_dir: %s\n", storage.BranchDocDir(output, node.Name))
+	fmt.Fprintf(&body, "branch: %s\nmode: %s\nparent: %s\nbase: %s\nhead: %s\nchain: %s\n\n",
+		node.Name, mode, emptyAs(node.Parent, "无"), base, node.Tip, chainNames(chain))
+	fmt.Fprintf(&body, "hash: %s\nparent: %s\ntime: %s\nsubject: %s\n", commit.Hash, commit.Parent, commit.Timestamp, commit.Subject)
+	if commit.Body != "" {
+		fmt.Fprintf(&body, "body:\n%s\n", commit.Body)
+	}
+	fmt.Fprintf(&body, "files:\n%s\n\n", bulletList(commit.Files))
+	diff := boundDirectCommitDiff(commit.Diff)
+	if diff != commit.Diff {
+		fmt.Fprintf(&body, "diff_status: truncated_to_%d_bytes\n", directCommitDiffExcerptMaxBytes)
+	}
+	fmt.Fprintf(&body, "diff:\n%s\n", diff)
+	return body.String()
+}
+
+func boundDirectCommitDiff(diff string) string {
+	if len([]byte(diff)) <= directCommitDiffExcerptMaxBytes {
+		return diff
+	}
+	data := []byte(diff)
+	headSize := directCommitDiffExcerptMaxBytes / 2
+	tailSize := directCommitDiffExcerptMaxBytes - headSize
+	omitted := len(data) - headSize - tailSize
+	head := strings.ToValidUTF8(string(data[:headSize]), "")
+	tail := strings.ToValidUTF8(string(data[len(data)-tailSize:]), "")
+	return fmt.Sprintf("%s\n\n[docs-seed: diff truncated; original_bytes=%d omitted_bytes=%d kept_first_bytes=%d kept_last_bytes=%d. Use the file list and current repository snapshot for verification if the omitted middle is relevant.]\n\n%s",
+		head, len(data), omitted, headSize, tailSize, tail)
 }
 
 func buildDirectArchiveMaterial(output string, node model.BranchNode) string {
@@ -1310,12 +1385,18 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 重要：本次 commit 的详细材料不在本提示词中。请先读取这个材料文件：
 %s
 
+工具使用硬约束：
+- 读取材料文件、现有 Markdown 或源码文件时，每次 Read 必须带 limit，且 limit 不超过 120 行；需要定位内容时优先使用 Grep。
+- 不要一次性读取完整 commit-evolution.md、archive 文件、checkpoint JSONL 或超长源码文件。
+- 写入成功后不要为了确认而回读完整文件；工具成功返回即视为写入完成。只在需要定位下一处精确替换点或工具失败时小范围读取。
+- 如果材料里的 diff 已被截断，先基于文件清单、提交信息和已保留 diff 判断；只有业务结论缺证据时，才精确读取相关源码小范围内容。
+
 如果材料文件列出 archived material 路径，它们只是已处理历史的查重/追溯索引。普通 commit 处理不要批量读取完整归档文件；归档汇总校准会使用单独的有界材料文件。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
 
-必须读取并更新这些文件；如果不存在则创建：
+必须按需小范围读取并更新这些文件；如果不存在则创建：
 - README.md
 - business-logic.md
 - data-flow.md
@@ -1330,7 +1411,8 @@ func buildDirectWriteCommitPrompt(output string, node model.BranchNode, mode, ba
 
 滚动更新规则：
 - 本次只根据材料文件中的当前 commit 更新文档。
-- 如果材料文件很大，可以使用 agent team/subagents 按文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
+- 推荐操作顺序：先 Read limit<=120 读取材料开头；再按提交 hash 用 Grep 检查 commit-evolution.md 是否已有小节；然后按需小范围读取目标 Markdown 附近内容；最后 Edit/MultiEdit/Write 写回。
+- 如果材料文件很大，可以使用 agent team/subagents 按文件分块阅读；但主 Agent 不要把所有分块结果或完整材料重新读入上下文，必须只汇总业务结论、去重并统一写回当前写入目录下的 Markdown 文件。
 - 对 business-logic.md、data-flow.md、adr.md：把当前 commit 带来的业务变化合并进已有总结；同时保留已有最终总结中的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须追加或更新一个当前 commit 小节，小节标题必须包含完整 hash %s 或短 hash %s；即使当前 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
@@ -1426,12 +1508,20 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 重要：当前批次的详细材料不在本提示词中。请先读取这个材料文件：
 %s
 
+工具使用硬约束：
+- 该材料文件是批次索引，只列出每个 commit 的 material_path。先 Read limit<=120 读取索引；禁止不带 limit 读取索引或材料。
+- 每次只处理一个 material_path。禁止一次性读取所有 commit material，禁止把所有 material 内容合并到上下文里。
+- 读取索引、commit material、现有 Markdown 或源码文件时，每次 Read 必须带 limit，且 limit 不超过 120 行；需要定位内容时优先使用 Grep。
+- 不要一次性读取完整 commit-evolution.md、archive 文件、checkpoint JSONL 或超长源码文件。
+- 写入成功后不要为了确认而回读完整文件；工具成功返回即视为写入完成。只在需要定位下一处精确替换点或工具失败时小范围读取。
+- 如果某个 commit material 里的 diff 已被截断，先基于文件清单、提交信息和已保留 diff 判断；只有业务结论缺证据时，才精确读取相关源码小范围内容。
+
 如果材料文件列出 archived material 路径，它们只是已处理历史的查重/追溯索引。普通 commit 处理不要批量读取完整归档文件；归档汇总校准会使用单独的有界材料文件。
 
 写入目录：%s
 当前工作目录就是写入目录。必须只写这个目录下的文件，禁止修改源码、配置、Git 文件或其他目录。
 
-必须读取并更新这些文件；如果不存在则创建：
+必须按需小范围读取并更新这些文件；如果不存在则创建：
 - README.md
 - business-logic.md
 - data-flow.md
@@ -1446,7 +1536,9 @@ func buildDirectWriteCommitBatchPrompt(output string, node model.BranchNode, mod
 
 滚动更新规则：
 - 必须严格按材料文件处理当前 session commit 批次。
-- 如果当前批次材料文件很大，可以使用 agent team/subagents 按 commit 或文件分块阅读；但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
+- 推荐操作顺序：先读取批次索引；按索引中的顺序逐个处理 material_path；每处理一个 commit 就记录需要写入的简短业务结论；全部 commit 处理完后，只对五个 Markdown 做一次合并写回。
+- 处理现有文档时，优先用 Grep 查找相同 hash、同名业务能力或相关标题；只按命中位置小范围读取。不要从第 1 行开始整文件翻页到结尾。
+- 当前批次材料按 commit 拆在多个 material_path 中；必须按 commit 或文件分块阅读。可使用 agent team/subagents 分块阅读，但必须由主 Agent 汇总、去重并统一写回当前写入目录下的 Markdown 文件。
 - 对 business-logic.md、data-flow.md、adr.md：把当前批次 commit 带来的业务变化合并进已有总结；同时保留已有最终总结中的历史业务事实；没有业务影响则不要强行新增。
 - 对 commit-evolution.md：必须为当前批次每个 commit 追加或更新一个小节，小节标题必须包含对应完整 hash 或短 hash；即使某个 commit 没有业务影响，也要记录“无可证实业务影响”的判断和证据。
 - 写完文档后必须通过 Bash 执行这个固化命令，确保当前批次每个 commit hash 一定记录到写入目录的 commit-evolution.md；该命令幂等，已存在则不会重复追加：
